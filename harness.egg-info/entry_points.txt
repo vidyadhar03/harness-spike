@@ -1,0 +1,2 @@
+[console_scripts]
+harness-memory = harness.memory.cli:main

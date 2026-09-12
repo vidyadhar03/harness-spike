@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: harness
+Version: 0.3.0
+Requires-Python: >=3.11
+Requires-Dist: pydantic>=2.7
+Requires-Dist: google-genai>=2.0
+Requires-Dist: google-cloud-firestore>=2.16
+Requires-Dist: google-cloud-storage>=2.16
+Requires-Dist: pypdfium2>=4.30
+Requires-Dist: pillow>=10
+Requires-Dist: json-repair>=0.30
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
+Requires-Dist: reportlab>=4; extra == "dev"

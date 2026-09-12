@@ -1,0 +1,11 @@
+pydantic>=2.7
+google-genai>=2.0
+google-cloud-firestore>=2.16
+google-cloud-storage>=2.16
+pypdfium2>=4.30
+pillow>=10
+json-repair>=0.30
+
+[dev]
+pytest>=8
+reportlab>=4
