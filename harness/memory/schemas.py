@@ -18,6 +18,7 @@ class OutLocation(Out):
     name: str
     aliases: list[str] = []
     existing_id: str | None = None
+    inside: str | None = None           # the location physically containing this one
 
 
 class OutScene(Out):
@@ -30,16 +31,18 @@ class OutScene(Out):
 class OutNote(Out):
     kind: Literal["description", "constraint", "tone"]
     body: str
-    locations: list[str] = []
-    scenes: list[str] = []
+    owner: str = ""                     # the one location this is about; "" with project_wide
     project_wide: bool = False
+    applies_to_places_within: bool = False
+    only_during_scene: str | None = None
+    mentions: list[str] = []            # other places named; never inherits the note
     page: int | None = None
     quote: str | None = None
 
 
 class OutReference(Out):
     caption: str
-    locations: list[str] = []
+    location: str = ""
     page: int | None = None
 
 

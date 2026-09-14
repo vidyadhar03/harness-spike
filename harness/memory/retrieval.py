@@ -1,7 +1,12 @@
 """Context retrieval: store-only reads that assemble a ContextPack and render it as markdown.
 
-No model calls, so the same memory state always yields the same pack. That is what
-makes a pack safe to snapshot when a location is locked.
+No model calls, so the same memory state always yields the same pack.
+
+The pack keeps three kinds of note visibly apart, because collapsing them is how a
+generation step ends up treating a dream flood as the market square's permanent geometry:
+  - owned, unconditional: what this place is
+  - conditional: true only during one scene
+  - inherited: owned by a confirmed ancestor, and marked as applying within it
 """
 from __future__ import annotations
 
@@ -10,7 +15,10 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from .models import PROJECT_SCOPE, ContextPack, Location, Note, ReferenceImage, Scene, Source
+from .models import (
+    PROJECT_SCOPE, ConditionalNotes, ContextPack, InheritedNotes, Location, Note,
+    ReferenceImage, Scene, Source,
+)
 from .ports import EntityDoc, Store
 from .resolver import natural_key, norm, scene_key
 
@@ -27,7 +35,7 @@ def _live(e: EntityDoc) -> bool:
 
 
 class _Graph:
-    """The project's entities, read once. Merge chains and scene-location links resolve in memory."""
+    """The project's entities, read once. Merges and containment resolve in memory."""
 
     def __init__(self, entities: list[EntityDoc]):
         self.by_id = {e.id: e for e in entities}
@@ -49,6 +57,23 @@ class _Graph:
         while frontier:
             frontier = [c for f in frontier for c in self.children.get(f, []) if c not in out]
             out += frontier
+        return out
+
+    def ancestors(self, entity_id: str) -> list[Location]:
+        """Confirmed containment only, nearest parent first. Proposed containment is
+        invisible until a human confirms it, so a guessed parent cannot leak facts."""
+        out: list[Location] = []
+        seen = {entity_id}
+        node = self.by_id.get(entity_id)
+        while isinstance(node, Location) and node.containment is not None:
+            if node.containment.status != "confirmed":
+                break
+            parent = self.target(node.containment.parent_id)
+            if not isinstance(parent, Location) or parent.id in seen or not _live(parent):
+                break
+            out.append(parent)
+            seen.add(parent.id)
+            node = parent
         return out
 
 
@@ -85,24 +110,6 @@ def resolve_scope(store: Store, project_id: str, ref: str, graph: _Graph | None 
 
 # --- packs --------------------------------------------------------------------------
 
-def _owned_elsewhere(note: Note, graph: "_Graph", own: set[str], related_type: type) -> bool:
-    """True when a related note belongs to a different entity of the pack's own type.
-
-    A scene can be set at several locations, so its notes would otherwise appear in every
-    one of those locations' packs. A note that names its own location belongs to that
-    location's pack only. A note scoped to the scene alone has no better owner and stays.
-    """
-    for ref in note.scope_refs:
-        target = graph.target(ref)
-        if target is None or ref == PROJECT_SCOPE:
-            continue
-        if isinstance(target, related_type):
-            continue                      # the link that pulled this note in
-        if target.id not in own:
-            return True
-    return False
-
-
 def _sort_key(n: Note):
     page = next((p.page for p in n.provenance if p.page is not None), 10**6)
     return _STATUS_ORDER.get(n.status, 9), _KIND_ORDER.get(n.kind, 9), page, n.created_at
@@ -114,15 +121,10 @@ def _visible(notes: list[Note], include_proposed: bool) -> list[Note]:
 
 
 def get_context(store: Store, project_id: str, scope_ref: str, *, include_proposed: bool = True) -> ContextPack:
-    """Everything the harness knows about one location, scene, or the project.
-
-    Location pack: its notes (plus merged-in entities), the scenes set there and their notes,
-    project-wide notes. Scene pack: its notes, the locations it is set in and their notes,
-    project-wide notes. Rejected notes never appear; proposed ones only when include_proposed.
-    """
+    """Everything the harness knows about one location, scene, or the project."""
     graph = _Graph(store.list_entities(project_id))
     scope_id = resolve_scope(store, project_id, scope_ref, graph)
-    project_notes = _visible(store.notes_for_scopes(project_id, [PROJECT_SCOPE]), include_proposed)
+    project_notes = _visible(store.notes_for_owners(project_id, [PROJECT_SCOPE]), include_proposed)
 
     if scope_id == PROJECT_SCOPE:
         return _finish(store, project_id, ContextPack(
@@ -130,56 +132,70 @@ def get_context(store: Store, project_id: str, scope_ref: str, *, include_propos
 
     entity = graph.by_id[scope_id]
     own = graph.own_ids(scope_id)
-    notes = _visible(store.notes_for_scopes(project_id, own), include_proposed)
+    owned = _visible(store.notes_for_owners(project_id, own), include_proposed)
+
+    # a fact true only during one scene is never the place's general state
+    unconditional = [n for n in owned if n.applicability.scene_id is None]
+    conditional: list[ConditionalNotes] = []
+    by_scene: dict[str, list[Note]] = {}
+    for n in owned:
+        if n.applicability.scene_id is not None:
+            by_scene.setdefault(n.applicability.scene_id, []).append(n)
 
     scenes: list[Scene] = []
     locations: list[Location] = []
+    ancestors: list[Location] = []
     if isinstance(entity, Location):
         scenes = sorted(
             (s for s in graph.by_id.values() if isinstance(s, Scene) and _live(s)
              and any((t := graph.target(lid)) is not None and t.id == scope_id for lid in s.location_ids)),
             key=lambda s: natural_key(s.number or ""),
         )
-        groups = [(s.id, graph.own_ids(s.id)) for s in scenes]
-    else:
+        ancestors = graph.ancestors(scope_id)
+    elif isinstance(entity, Scene):
         for lid in entity.location_ids:
             loc = graph.target(lid)
             if isinstance(loc, Location) and _live(loc) and all(l.id != loc.id for l in locations):
                 locations.append(loc)
-        groups = [(l.id, graph.own_ids(l.id)) for l in locations]
 
-    seen = {n.id for n in notes}
-    related_scope = [i for _, ids in groups for i in ids]
-    related = []
-    if related_scope:
-        owner_type = Scene if isinstance(entity, Location) else Location
-        related = [n for n in _visible(store.notes_for_scopes(project_id, related_scope), include_proposed)
-                   if n.id not in seen and not _owned_elsewhere(n, graph, set(own), owner_type)]
-    related_by: dict[str, list[str]] = {}
-    placed: set[str] = set()
-    for gid, ids in groups:
-        members = [n.id for n in related if n.id not in placed and set(ids) & set(n.scope_refs)]
-        if members:
-            related_by[gid] = members
-            placed |= set(members)
+    labels = {s.id: f"{s.number} · {s.name}" if s.number else s.name for s in scenes}
+    for scene_id, notes in by_scene.items():
+        scene = graph.target(scene_id)
+        label = labels.get(scene_id) or (scene.name if scene else scene_id)
+        conditional.append(ConditionalNotes(scene_id=scene_id, label=label, notes=notes))
+    conditional.sort(key=lambda c: natural_key(c.label))
 
-    seen |= {n.id for n in related}
+    inherited: list[InheritedNotes] = []
+    for parent in ancestors:
+        parent_ids = graph.own_ids(parent.id)
+        notes = [n for n in _visible(store.notes_for_owners(project_id, parent_ids), include_proposed)
+                 if n.applicability.include_descendants and n.applicability.scene_id is None]
+        if notes:
+            inherited.append(InheritedNotes(entity_id=parent.id, name=parent.name, notes=notes))
+
+    seen = {n.id for n in owned} | {n.id for i in inherited for n in i.notes}
     # unattributed reference images would flood every pack; they live in the project pack
     project_notes = [n for n in project_notes if n.kind != "reference_image" and n.id not in seen]
 
     return _finish(store, project_id, ContextPack(
         scope_id=scope_id, entity=entity, include_proposed=include_proposed, merged_ids=own[1:],
-        notes=notes, related_notes=related, related_by=related_by, project_notes=project_notes,
-        scenes=scenes, locations=locations,
+        notes=unconditional, conditional=conditional, inherited=inherited,
+        project_notes=project_notes, scenes=scenes, locations=locations, ancestors=ancestors,
     ))
 
 
+def _all_notes(pack: ContextPack) -> list[Note]:
+    return (pack.notes + [n for c in pack.conditional for n in c.notes]
+            + [n for i in pack.inherited for n in i.notes] + pack.project_notes)
+
+
 def _finish(store: Store, project_id: str, pack: ContextPack) -> ContextPack:
-    everything = pack.notes + pack.related_notes + pack.project_notes
+    everything = _all_notes(pack)
     sources = store.get_sources(project_id, [p.source_id for n in everything for p in n.provenance if p.source_id])
     pack.sources = {sid: s.filename for sid, s in sources.items()}
+    pack.superseded_sources = sorted({s.filename for s in sources.values() if s.superseded})
     pack.reference_images = [
-        ref for n in pack.notes + pack.related_notes
+        ref for n in pack.notes + [x for c in pack.conditional for x in c.notes]
         if n.kind == "reference_image" and (ref := _reference(n, sources)) is not None
     ]
     return pack
@@ -248,25 +264,31 @@ def render_context_md(pack: ContextPack) -> str:
         lines += [f"# {e.name}", f"{kind} · `{e.id}` · {e.status}"]
         if isinstance(e, Location) and e.aliases:
             lines.append(f"Also called: {', '.join(e.aliases)}")
+        if pack.ancestors:
+            lines.append("Inside: " + " → ".join(a.name for a in reversed(pack.ancestors)))
         if pack.merged_ids:
             lines.append(f"Merged in: {', '.join(f'`{i}`' for i in pack.merged_ids)}")
         lines.append("")
     lines.append("Notes marked [proposed] are unreviewed." if pack.include_proposed
                  else "Confirmed notes only.")
+    if pack.superseded_sources:
+        lines.append(f"Some notes come from superseded drafts: {', '.join(pack.superseded_sources)}. "
+                     "They have not been reconciled against the current version.")
     lines.append("")
 
     body = [n for n in pack.notes if n.kind != "reference_image"]
     lines += _kind_sections(body, src, "##") or ["_No notes yet._", ""]
 
-    if pack.reference_images:
+    refs = pack.reference_images
+    if refs:
         lines.append("## Reference images")
         groups: dict[str | None, list] = {}
-        for r in pack.reference_images:
+        for r in refs:
             groups.setdefault(r.group, []).append(r)
-        for group, refs in sorted(groups.items(), key=lambda kv: (kv[0] is None, kv[0] or "")):
+        for group, items in sorted(groups.items(), key=lambda kv: (kv[0] is None, kv[0] or "")):
             if group:
                 lines.append(f"### {group}")
-            for r in refs:
+            for r in items:
                 where = r.attribution or pack.sources.get(r.source_id, r.source_id[:12])
                 if r.page:
                     where += f" p.{r.page}"
@@ -278,40 +300,46 @@ def render_context_md(pack: ContextPack) -> str:
                 lines.append(f"- {flag}{' '.join(r.caption.split())} — `{r.uri}` _({where})_ <!-- {r.note_id} -->")
             lines.append("")
 
+    if pack.conditional:
+        lines += ["## Only during these scenes",
+                  "_True while the scene plays, not the place's usual state._", ""]
+        for group in pack.conditional:
+            text = [n for n in group.notes if n.kind != "reference_image"]
+            if text:
+                lines += [f"### {group.label}", *[_bullet(n, src) for n in text], ""]
+
+    if pack.inherited:
+        lines.append("## Inherited")
+        for group in pack.inherited:
+            lines += [f"### From {group.name}", *[_bullet(n, src) for n in group.notes], ""]
+
     if isinstance(e, Location) and pack.scenes:
-        lines += ["## Scenes set here", *[f"- {s.number} · {s.name} `{s.id}`" for s in pack.scenes], ""]
-        lines += _grouped(pack, [(s.id, f"{s.number} · {s.name}") for s in pack.scenes], "## Scene notes")
+        lines += ["## Scenes set here",
+                  *[f"- {s.number} · {s.name} `{s.id}`" for s in pack.scenes], ""]
     if isinstance(e, Scene) and pack.locations:
         lines += ["## Set in", *[f"- {l.name} `{l.id}`" for l in pack.locations], ""]
-        lines += _grouped(pack, [(l.id, l.name) for l in pack.locations], "## Location context")
 
     if pack.project_notes:
         lines += ["## Project-wide", *[_bullet(n, src) for n in pack.project_notes], ""]
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _grouped(pack: ContextPack, groups: list[tuple[str, str]], heading: str) -> list[str]:
-    by_id = {n.id: n for n in pack.related_notes if n.kind != "reference_image"}
-    out: list[str] = []
-    for gid, title in groups:
-        group = [by_id[i] for i in pack.related_by.get(gid, []) if i in by_id]
-        if group:
-            out += [f"### {title}", *[_bullet(n, pack.sources) for n in group], ""]
-    return [heading, "", *out] if out else []
-
-
 # --- index and export -------------------------------------------------------------
+
+def _n(count: int, word: str) -> str:
+    return f"{count} {word}" + ("" if count == 1 else "s")
+
 
 def render_index_md(store: Store, project_id: str) -> str:
     """The root listing an agent reads first: what exists and how much is known about each."""
     graph = _Graph(store.list_entities(project_id))
     notes = [n for n in store.list_notes(project_id) if n.status != "rejected"]
     sources = store.list_sources(project_id)
-    by_scope = Counter(ref for n in notes for ref in n.scope_refs)
+    owned = Counter(n.owner_id for n in notes)
 
     def count(entity_id: str) -> int:
         ids = set(graph.own_ids(entity_id))
-        return sum(1 for n in notes if ids & set(n.scope_refs))
+        return sum(1 for n in notes if n.owner_id in ids)
 
     live = [e for e in graph.by_id.values() if _live(e)]
     locs = sorted((e for e in live if isinstance(e, Location)), key=lambda e: e.name.lower())
@@ -327,17 +355,20 @@ def render_index_md(store: Store, project_id: str) -> str:
              "", f"## Locations ({len(locs)})"]
     for l in locs:
         aka = f" · aka {', '.join(l.aliases)}" if l.aliases else ""
-        lines.append(f"- {l.name} `{l.id}` · {l.status} · {_n(count(l.id), 'note')} · {_n(scene_count[l.id], 'scene')}{aka}")
+        inside = ""
+        if l.containment is not None:
+            parent = graph.target(l.containment.parent_id)
+            if parent is not None:
+                mark = "" if l.containment.status == "confirmed" else " (proposed)"
+                inside = f" · inside {parent.name}{mark}"
+        lines.append(f"- {l.name} `{l.id}` · {l.status} · {_n(count(l.id), 'note')} · "
+                     f"{_n(scene_count[l.id], 'scene')}{inside}{aka}")
     lines += ["", f"## Scenes ({len(scenes)})"]
     lines += [f"- {s.number} · {s.name} `{s.id}` · {_n(count(s.id), 'note')}" for s in scenes]
-    unattributed = sum(1 for n in notes if PROJECT_SCOPE in n.scope_refs and n.kind == "reference_image")
-    lines += ["", "## Project-wide", f"- {_n(by_scope[PROJECT_SCOPE] - unattributed, 'note')}, "
+    unattributed = sum(1 for n in notes if n.owner_id == PROJECT_SCOPE and n.kind == "reference_image")
+    lines += ["", "## Project-wide", f"- {_n(owned[PROJECT_SCOPE] - unattributed, 'note')}, "
                                      f"{_n(unattributed, 'unattributed reference image')}"]
     return "\n".join(lines) + "\n"
-
-
-def _n(count: int, word: str) -> str:
-    return f"{count} {word}" + ("" if count == 1 else "s")
 
 
 def _slug(text: str) -> str:
@@ -345,7 +376,7 @@ def _slug(text: str) -> str:
 
 
 def export_context(store: Store, project_id: str, out_dir: str | Path, *, include_proposed: bool = True) -> list[Path]:
-    """Writes INDEX.md, project.md, locations/*.md, scenes/*.md. Diff two exports to compare digest versions."""
+    """Writes INDEX.md, project.md, locations/*.md, scenes/*.md."""
     root = Path(out_dir)
     (root / "locations").mkdir(parents=True, exist_ok=True)
     (root / "scenes").mkdir(parents=True, exist_ok=True)

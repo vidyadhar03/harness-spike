@@ -12,6 +12,15 @@ from .ports import Blob, EntityDoc, OutputTruncated, Part, T, Text, Uri
 from .schemas import gemini_schema, parse_json
 
 log = logging.getLogger(__name__)
+
+
+def firestore_transactional(db):
+    from google.cloud import firestore
+
+    def wrap(fn):
+        return firestore.transactional(fn)
+
+    return wrap
 _ENTITY = TypeAdapter(Entity)
 _BATCH = 400  # Firestore caps a batch at 500 writes
 _ANY = 30     # Firestore caps array-contains-any at 30 values
@@ -72,8 +81,19 @@ class FirestoreStore:
             q = q.where(filter=FieldFilter("origin.source_id", "==", source_id))
         return [Note.model_validate(d.to_dict()) for d in q.stream()]
 
-    def notes_for_scopes(self, project_id, scope_refs):
-        return self._contains_any(self._col(project_id, "notes"), "scope_refs", scope_refs, Note.model_validate)
+    def notes_for_owners(self, project_id, owner_ids):
+        """Owner is a single field, so this is plain equality - batched only because
+        Firestore caps an `in` query at 30 values."""
+        from google.cloud.firestore_v1.base_query import FieldFilter
+
+        col = self._col(project_id, "notes")
+        found: dict = {}
+        values = list(dict.fromkeys(owner_ids))
+        for i in range(0, len(values), _ANY):
+            q = col.where(filter=FieldFilter("owner_id", "in", values[i : i + _ANY]))
+            for d in q.stream():
+                found.setdefault(d.id, Note.model_validate(d.to_dict()))
+        return list(found.values())
 
     def get_sources(self, project_id, source_ids):
         refs = [self._col(project_id, "sources").document(i) for i in dict.fromkeys(source_ids)]
@@ -81,16 +101,42 @@ class FirestoreStore:
             return {}
         return {snap.id: Source.model_validate(snap.to_dict()) for snap in self._db.get_all(refs) if snap.exists}
 
-    def _contains_any(self, col, field: str, values: list[str], parse):  # noqa: D401
-        from google.cloud.firestore_v1.base_query import FieldFilter
+    def acquire_lock(self, project_id, holder, stale_after_s):
+        """One ingest at a time per project. Serial operation is what makes it safe to
+        replace proposals without transactional publication; this makes it enforced
+        rather than a convention someone forgets in a second terminal."""
+        from datetime import timedelta
 
-        found: dict = {}
-        values = list(dict.fromkeys(values))
-        for i in range(0, len(values), _ANY):
-            q = col.where(filter=FieldFilter(field, "array_contains_any", values[i : i + _ANY]))
-            for d in q.stream():
-                found.setdefault(d.id, parse(d.to_dict()))
-        return list(found.values())
+        from google.api_core import exceptions
+
+        from .models import new_id, utcnow
+
+        ref = self._project(project_id).collection("locks").document("ingest")
+        token = new_id("lock")
+        now = utcnow()
+        transaction = self._db.transaction()
+
+        @firestore_transactional(self._db)
+        def _claim(tx):
+            snap = ref.get(transaction=tx)
+            if snap.exists:
+                held = snap.to_dict()
+                taken_at = held.get("taken_at")
+                if taken_at is not None and now - taken_at < timedelta(seconds=stale_after_s):
+                    return None
+            tx.set(ref, {"token": token, "holder": holder, "taken_at": now})
+            return token
+
+        try:
+            return _claim(transaction)
+        except exceptions.Aborted:
+            return None
+
+    def release_lock(self, project_id, token):
+        ref = self._project(project_id).collection("locks").document("ingest")
+        snap = ref.get()
+        if snap.exists and snap.to_dict().get("token") == token:
+            ref.delete()
 
     def put_notes(self, project_id, notes):
         self._write(project_id, "notes", [(n.id, n.model_dump()) for n in notes])

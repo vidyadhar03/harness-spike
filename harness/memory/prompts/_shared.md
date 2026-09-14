@@ -14,11 +14,14 @@ Base every note on the provided file. Use the known-entities list in the user me
 - quote: a short verbatim excerpt from the file (under 25 words) that supports the note, when the file has text. Keep the original language and spelling.
 
 ## Scoping
-- Every note names the location it is about, in `locations`. This is the field later steps read, so a note scoped only to a scene is lost. Name the location even when the scene makes it obvious, and even when the location appears in the scene's own heading.
-- `scenes` is an addition to `locations`, never a replacement. Use it when the fact is true only during that scene (a flood, a fire, a crowd, damage) rather than of the place in general. A fact true of the place whenever you shoot it gets a location and no scene.
-- A note about a place inside a dream, memory, or flashback is scoped to that real place. A flood moving through the market square in a dream is a Market Square note.
-- Set `project_wide` for facts true across the whole production rather than of one place: world rules and customs (a bell that empties the streets every evening), the period, the season, and the overall visual language. These are valuable and easy to miss, so look for them in every excerpt. `project_wide` is an addition to `locations`, not a replacement: if the fact is also about a specific place, name that location too, so a custom observed across the whole village is both a Devgram note and a project-wide one. Leave `locations` empty only when the fact belongs to no single place.
-- A note with no location and no project_wide flag is discarded, however good it is.
+Every note has exactly one owner: the single thing the note is about. Ownership is not a list.
+
+- `owner`: the one location this fact is about. Name it even when the scene makes it obvious, and even when the location appears in the scene's heading. Pick the most specific place the fact is actually about: a fact about what a market stall looks like is owned by the market square, not by the village containing it.
+- `project_wide`: set this instead of an owner, and only for facts that belong to the production rather than to any place: the period, the season, the overall visual grammar, a rule about how the whole film is shot or sounds. Leave `owner` empty when you set it. "The village is prosperous" is a fact about the village, so it is owned by the village and is not project-wide.
+- `applies_to_places_within`: set this when the fact is true of the owner AND of every place inside it. A curfew that empties the whole village is true of its market square and its lanes, so it applies within. A fact about the owner's own fabric or extent ("the village has three hundred houses", "the temple's walls are absorbed by roots") is true only of the owner itself, so leave this false. Default to false when unsure: a fact that fails to reach a child is a small loss, and a fact wrongly applied to a child is a wrong description of that place.
+- `only_during_scene`: the scene number, when the fact is true only during that scene rather than of the place in general. A flood, a fire, a crowd, damage, a dream. A fact true of the place whenever you shoot it leaves this empty. Facts inside a dream, memory, or flashback are owned by the real place they depict, with this set to that scene.
+- `mentions`: other places this note names in passing. These are links for a reader, never a claim that the note describes them. A note about a bridge that mentions a temple visible across the river is owned by the bridge and mentions the temple.
+- A note with neither an owner nor `project_wide` is discarded, however good it is.
 
 ## Locations
 - A location is a physical place a camera can be put in: a village, a house, a room in that house, a courtyard, a stretch of road. Sub-places that would be shot or built separately are separate locations (Temple, Temple courtyard, Temple sanctum).

@@ -8,7 +8,7 @@ from reportlab.pdfgen import canvas
 
 from harness.memory.config import Settings
 from harness.memory.ingest import Ctx, digest_version, ingest_source, register_file
-from harness.memory.models import PROJECT_SCOPE, Location, Project, Scene
+from harness.memory.models import PROJECT_SCOPE, Applicability, Location, Project, Scene
 from harness.memory.ports import Blob, MemoryBlobs, MemoryStore, OutputTruncated, Text
 from harness.memory.schemas import (
     ClassifyOut, ImageOut, NotesOut, OutLocation, OutNote, OutReference, OutScene, RosterOut, gemini_schema,
@@ -82,7 +82,8 @@ def script_handler(schema, system, parts):
         return ClassifyOut(doc_type="script")
     if schema is RosterOut:
         return RosterOut(
-            locations=[OutLocation(name="Devgram well", aliases=["the well"]), OutLocation(name="Temple courtyard")],
+            locations=[OutLocation(name="Devgram well", aliases=["the well"], inside="Devgram"),
+                       OutLocation(name="Temple courtyard")],
             scenes=[OutScene(number="1", heading="EXT. DEVGRAM WELL - NIGHT", locations=["Devgram well"]),
                     OutScene(number="2", heading="EXT. TEMPLE COURTYARD - DAY", locations=["Temple courtyard"])],
         )
@@ -91,17 +92,19 @@ def script_handler(schema, system, parts):
         if "- 1 | EXT. DEVGRAM WELL - NIGHT" in text:
             return NotesOut(notes=[
                 OutNote(kind="description", body="Stone well, waist high, rope worn smooth.",
-                        locations=["the well"], scenes=["1"], page=1, quote="A stone well."),
-                OutNote(kind="constraint", body="No electricity poles anywhere in Devgram.", project_wide=True, page=2),
+                        owner="the well", page=1, quote="A stone well."),
+                OutNote(kind="constraint", body="No electricity poles anywhere in Devgram.",
+                        project_wide=True, page=2),
                 OutNote(kind="description", body="Old banyan tree with a deep fissure.",
-                        locations=["Old banyan tree"], scenes=["99"], page=2),
-                OutNote(kind="description", body="Floating fact with no scope.", page=1),
+                        owner="Old banyan tree", only_during_scene="99", page=2),
+                OutNote(kind="description", body="Floating fact with no owner.", page=1),
             ])
         return NotesOut(notes=[
             OutNote(kind="description", body="Courtyard paved with uneven slate.",
-                    locations=["Temple courtyard"], scenes=["Scene 2"], page=3),
+                    owner="Temple courtyard", only_during_scene="Scene 2", page=3,
+                    mentions=["Devgram well"]),
             OutNote(kind="description", body="Stone well, waist high, rope worn smooth.",
-                    locations=["Devgram well"], page=4),
+                    owner="Devgram well", page=4),
         ])
     raise AssertionError(schema)
 
@@ -134,23 +137,33 @@ def test_script_pdf_builds_roster_notes_and_provenance():
     assert report.status == "digested" and report.doc_type == "script"
 
     ents = by_name(ctx)
-    assert {n for n, e in ents.items() if isinstance(e, Location)} == {"Devgram well", "Temple courtyard", "Old banyan tree"}
+    assert {n for n, e in ents.items() if isinstance(e, Location)} == {
+        "Devgram well", "Temple courtyard", "Old banyan tree", "Devgram"}
     well, courtyard = ents["Devgram well"], ents["Temple courtyard"]
     scene1 = next(e for e in ents.values() if isinstance(e, Scene) and e.number == "1")
+    scene2 = next(e for e in ents.values() if isinstance(e, Scene) and e.number == "2")
     assert scene1.location_ids == [well.id]
+    # the roster proposed containment; it stays proposed until a human confirms it
+    assert well.containment.parent_id == ents["Devgram"].id and well.containment.status == "proposed"
 
     notes = {n.body: n for n in ctx.store.list_notes(PID)}
     assert len(notes) == 4
     well_note = notes["Stone well, waist high, rope worn smooth."]
-    assert set(well_note.scope_refs) == {well.id, scene1.id}           # alias resolved, chunks merged
-    assert [p.page for p in well_note.provenance] == [1, 4]
+    assert well_note.owner_id == well.id                         # alias resolved
+    assert well_note.applicability == Applicability()
+    assert [p.page for p in well_note.provenance] == [1, 4]      # one note, two occurrences
     assert well_note.provenance[0].quote == "A stone well."
-    assert notes["No electricity poles anywhere in Devgram."].scope_refs == [PROJECT_SCOPE]
-    assert notes["Old banyan tree with a deep fissure."].scope_refs == [ents["Old banyan tree"].id]
-    assert courtyard.id in notes["Courtyard paved with uneven slate."].scope_refs
+    assert all(p.extracted_body == well_note.body for p in well_note.provenance)
+    assert notes["No electricity poles anywhere in Devgram."].owner_id == PROJECT_SCOPE
+    assert notes["Old banyan tree with a deep fissure."].owner_id == ents["Old banyan tree"].id
+    courtyard_note = notes["Courtyard paved with uneven slate."]
+    assert courtyard_note.owner_id == courtyard.id
+    assert courtyard_note.applicability.scene_id == scene2.id    # conditional, not general
+    assert courtyard_note.mentions == [well.id]                  # mention never owns
     assert all(n.origin.digest_version == digest_version(ctx.llm) for n in notes.values())
     assert any("unknown scene '99'" in w for w in report.warnings)
-    assert any("unscoped" in w for w in report.warnings)
+    assert any("no owner" in w for w in report.warnings)
+    assert report.warn_counts == {"unowned_notes": 1}
 
     stored = ctx.store.get_source(PID, src.id)
     assert stored.derived.page_count == 4
@@ -165,15 +178,18 @@ def test_same_version_skips_and_force_redigest_keeps_reviewed_notes():
     assert len(ctx.llm.calls) == calls
 
     confirmed = next(n for n in ctx.store.list_notes(PID) if n.body.startswith("Stone well"))
-    ctx.store.put_notes(PID, [confirmed.model_copy(update={"status": "confirmed"})])
+    ctx.store.put_notes(PID, [confirmed.model_copy(update={
+        "status": "confirmed", "reviewed_revision": confirmed.revision, "reviewed_by": "vd"})])
 
     report = ingest_source(ctx, PID, src.id, force=True)
     assert report.status == "digested"
-    assert (report.entities_created, report.notes_replaced, report.notes_written) == (0, 3, 3)
+    # unchanged candidates keep their ids; the confirmed one is reused, not rewritten
+    assert (report.entities_created, report.notes_replaced, report.notes_written,
+            report.notes_reused) == (0, 0, 3, 1)
     notes = ctx.store.list_notes(PID)
     assert len(notes) == 4
     assert [n.status for n in notes if n.body.startswith("Stone well")] == ["confirmed"]
-    assert len(ctx.store.list_entities(PID)) == 5
+    assert len(ctx.store.list_entities(PID)) == 6
 
 
 def test_visual_pdf_renders_pages_and_offsets_page_numbers():
@@ -181,7 +197,7 @@ def test_visual_pdf_renders_pages_and_offsets_page_numbers():
         if schema is ClassifyOut:
             return ClassifyOut(doc_type="lookbook")
         return NotesOut(references=[
-            OutReference(caption="Mud-plastered wall at dusk.", locations=["Devgram well"], page=2),
+            OutReference(caption="Mud-plastered wall at dusk.", location="Devgram well", page=2),
             OutReference(caption="Out of range page.", page=9),
         ], notes=[OutNote(kind="tone", body="Muted ochre palette.", project_wide=True, page=1)])
 
@@ -208,8 +224,8 @@ def test_image_resolves_merged_and_skips_rejected_locations():
         assert isinstance(parts[-1], Blob) and parts[-1].mime_type == "image/png"
         assert "Old well" not in all_text(parts) and "Devgram well" in all_text(parts)
         return ImageOut(doc_type="recce",
-                        references=[OutReference(caption="Well at dusk, rope coiled on the rim.", locations=["old well"])],
-                        notes=[OutNote(kind="description", body="Palace gate carved sandstone.", locations=["Haunted palace"])])
+                        references=[OutReference(caption="Well at dusk, rope coiled on the rim.", location="old well")],
+                        notes=[OutNote(kind="description", body="Palace gate carved sandstone.", owner="Haunted palace")])
 
     ctx = make_ctx(handler)
     ctx.store.put_entities(PID, [target, old, bad])
@@ -217,7 +233,7 @@ def test_image_resolves_merged_and_skips_rejected_locations():
     report = ingest_source(ctx, PID, src.id)
     notes = ctx.store.list_notes(PID)
     assert report.doc_type == "recce" and len(notes) == 1
-    assert notes[0].kind == "reference_image" and notes[0].scope_refs == [target.id]
+    assert notes[0].kind == "reference_image" and notes[0].owner_id == target.id
     assert notes[0].provenance[0].page is None
     assert report.entities_created == 0
 
@@ -237,7 +253,7 @@ def test_llm_failure_marks_source_failed_and_retry_succeeds():
     assert ctx.store.list_notes(PID) == []
     state["fail"] = False
     assert ingest_source(ctx, PID, src.id).status == "digested"
-    assert len([e for e in ctx.store.list_entities(PID) if isinstance(e, Location)]) == 3
+    assert len([e for e in ctx.store.list_entities(PID) if isinstance(e, Location)]) == 4
 
 
 def test_markdown_notes_have_no_pages():
@@ -245,7 +261,7 @@ def test_markdown_notes_have_no_pages():
         if schema is ClassifyOut:
             return ClassifyOut(doc_type="notes")
         return NotesOut(notes=[OutNote(kind="constraint", body="Shoot the well only after sunset.",
-                                       locations=["Devgram well"], page=3)])
+                                       owner="Devgram well", page=3)])
 
     ctx = make_ctx(handler)
     src, _ = register_file(ctx, PID, b"# Director notes\n\nWell scenes after sunset.", "notes/director.md")
@@ -293,7 +309,9 @@ def test_truncated_unit_is_split_and_retried():
             if "- 1 | " in text and "- 2 | " in text:
                 raise OutputTruncated("too long")
             n = "1" if "- 1 | " in text else "2"
-            return NotesOut(notes=[OutNote(kind="description", body=f"Fact for scene {n}.", scenes=[n], page=1)])
+            owner = "Devgram well" if n == "1" else "Temple courtyard"
+            return NotesOut(notes=[OutNote(kind="description", body=f"Fact for scene {n}.",
+                                           owner=owner, only_during_scene=n, page=1)])
         return script_handler(schema, system, parts)
 
     ctx = make_ctx(handler)  # default budget packs both scenes into one unit
@@ -374,8 +392,10 @@ def test_scanned_script_uses_start_pages_and_drops_out_of_scope_notes():
         text = all_text(parts)
         contexts.append(text)
         if "- 2 | " in text:
-            return NotesOut(notes=[OutNote(kind="description", body="Courtyard slate.", scenes=["2"], page=1)])
-        return NotesOut(notes=[OutNote(kind="description", body="Courtyard slate, seen early.", scenes=["2"], page=4)])
+            return NotesOut(notes=[OutNote(kind="description", body="Courtyard slate.",
+                                           owner="Temple courtyard", only_during_scene="2", page=1)])
+        return NotesOut(notes=[OutNote(kind="description", body="Courtyard slate, seen early.",
+                                       owner="Temple courtyard", only_during_scene="2", page=4)])
 
     ctx = make_ctx(handler, scanned_script_chunk_pages=3)
     src, _ = register_file(ctx, PID, visual_pdf(6), "scanned_script.pdf")
@@ -402,21 +422,26 @@ def test_unit_splits_keep_pages_and_continuation():
     assert PdfUnit(2, 3, [s2], [2]).split() is None
 
 
-def test_scene_only_notes_are_counted_not_silently_kept():
+def test_a_named_owner_beats_the_project_wide_flag():
+    """A model that sets both is describing a place, not a production-wide rule."""
     def handler(schema, system, parts):
         if schema is NotesOut:
-            text = all_text(parts)
-            if "- 1 | " in text:
+            if "- 1 | " in all_text(parts):
                 return NotesOut(notes=[
-                    OutNote(kind="description", body="Scene-only fact.", scenes=["1"], page=1),
-                    OutNote(kind="description", body="Properly scoped fact.",
-                            locations=["Devgram well"], scenes=["1"], page=1),
-                    OutNote(kind="constraint", body="World rule.", project_wide=True, page=1),
+                    OutNote(kind="description", body="The village is prosperous.",
+                            owner="Devgram well", project_wide=True,
+                            applies_to_places_within=True, page=1),
+                    OutNote(kind="tone", body="Longer lenses throughout.", project_wide=True,
+                            applies_to_places_within=True, page=1),
                 ])
             return NotesOut()
         return script_handler(schema, system, parts)
 
     ctx = make_ctx(handler)
     _, report = run_script(ctx)
-    assert report.warn_counts == {"scene_only_notes": 1}     # visible in the run summary
-    assert report.notes_written == 3                          # still stored; the count is the signal
+    notes = {n.body: n for n in ctx.store.list_notes(PID)}
+    village = notes["The village is prosperous."]
+    assert village.owner_id != PROJECT_SCOPE and village.applicability.include_descendants
+    lenses = notes["Longer lenses throughout."]
+    assert lenses.owner_id == PROJECT_SCOPE
+    assert not lenses.applicability.include_descendants      # project notes apply everywhere already

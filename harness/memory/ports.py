@@ -87,8 +87,10 @@ class Store(Protocol):
     def get_entity(self, project_id: str, entity_id: str) -> EntityDoc | None: ...
     def put_entities(self, project_id: str, entities: list[EntityDoc]) -> None: ...
     def list_notes(self, project_id: str, *, source_id: str | None = None) -> list[Note]: ...
-    def notes_for_scopes(self, project_id: str, scope_refs: list[str]) -> list[Note]: ...
+    def notes_for_owners(self, project_id: str, owner_ids: list[str]) -> list[Note]: ...
     def get_sources(self, project_id: str, source_ids: list[str]) -> dict[str, Source]: ...
+    def acquire_lock(self, project_id: str, holder: str, stale_after_s: int) -> str | None: ...
+    def release_lock(self, project_id: str, token: str) -> None: ...
     def put_notes(self, project_id: str, notes: list[Note]) -> None: ...
     def delete_notes(self, project_id: str, note_ids: list[str]) -> None: ...
 
@@ -128,6 +130,7 @@ class MemoryStore:
         self.sources: dict[tuple[str, str], Source] = {}
         self.entities: dict[tuple[str, str], EntityDoc] = {}
         self.notes: dict[tuple[str, str], Note] = {}
+        self.locks: dict[str, str] = {}
 
     def get_project(self, project_id):
         return self.projects.get(project_id)
@@ -162,12 +165,24 @@ class MemoryStore:
             if p == project_id and (source_id is None or (n.origin and n.origin.source_id == source_id))
         ]
 
-    def notes_for_scopes(self, project_id, scope_refs):
-        refs = set(scope_refs)
-        return [n for n in self.list_notes(project_id) if refs & set(n.scope_refs)]
+    def notes_for_owners(self, project_id, owner_ids):
+        owners = set(owner_ids)
+        return [n for n in self.list_notes(project_id) if n.owner_id in owners]
 
     def get_sources(self, project_id, source_ids):
         return {i: s for i in dict.fromkeys(source_ids) if (s := self.get_source(project_id, i))}
+
+    def acquire_lock(self, project_id, holder, stale_after_s):
+        current = self.locks.get(project_id)
+        if current is not None:
+            return None
+        token = f"lock_{holder}"
+        self.locks[project_id] = token
+        return token
+
+    def release_lock(self, project_id, token):
+        if self.locks.get(project_id) == token:
+            del self.locks[project_id]
 
     def put_notes(self, project_id, notes):
         for n in notes:

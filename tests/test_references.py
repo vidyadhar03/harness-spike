@@ -31,7 +31,7 @@ def world():
     scene = Scene(name="EXT. DEVGRAM WELL - NIGHT", number="1", location_ids=[well.id], author="agent")
     store.put_entities(PID, [well, scene])
     store.put_notes(PID, [Note(kind="description", body="Stone well in a hill village, slate roofs behind.",
-                              scope_refs=[well.id], author="user")])
+                              owner_id=well.id, author="user")])
 
     images = {t: [hit(i, t.split()[0]) for i in range(4)] for t in VERIFIED}
     blobs = {h.preview_url: f"bytes-{h.preview_url}".encode()
@@ -103,7 +103,7 @@ def test_images_are_grouped_stored_and_written_back(world):
     assert len(refs) == 4 and len(vocab) == 1
     assert {n.group for n in refs} == {"Weathered slate and dark timber — Older, heavier.",
                                        "Open terraced slopes — Wider, greener."}
-    assert all(n.status == "proposed" and n.scope_refs == [well.id] for n in refs)
+    assert all(n.status == "proposed" and n.owner_id == well.id for n in refs)
     assert all(n.origin.producer == "references" and n.origin.scope == well.id for n in refs + vocab)
     assert refs[0].body.startswith("Caption ")           # the rationale lives on the group, not every caption
     assert vocab[0].provenance[0].url.startswith("https://en.wikipedia.org/wiki/")

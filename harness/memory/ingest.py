@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -18,15 +20,21 @@ from .files import (
     PDF, SUPPORTED_MIME, extension_for, is_visual, kind_for, page_marked, page_ranges,
     pdf_page_texts, pdf_subset, render_pages_png, sniff_mime, text_chunks,
 )
-from .models import PROJECT_SCOPE, Derived, Note, NoteOrigin, Provenance, Source, utcnow
+from .models import (
+    PROJECT_SCOPE, Applicability, Derived, Note, NoteOrigin, Provenance, Source, new_id, utcnow,
+)
 from .ports import LLM, Blob, Blobs, OutputTruncated, Part, Store, T, Text, Uri
 from .resolver import EntityResolver
 from .schemas import ClassifyOut, ImageOut, NotesOut, OutReference, OutScene, RosterOut
 
 log = logging.getLogger(__name__)
 
-PIPELINE_VERSION = "ingest-v1"
+PIPELINE_VERSION = "ingest-v2"
+CODE_FILES = ("ingest.py", "chunks.py", "files.py", "resolver.py", "schemas.py", "models.py")
 PROMPTS = Path(__file__).parent / "prompts"
+
+
+LOCK_STALE_AFTER_S = 3600
 
 
 @dataclass
@@ -46,6 +54,8 @@ class IngestReport:
     entities_created: int = 0
     notes_written: int = 0
     notes_replaced: int = 0
+    notes_reused: int = 0
+    extraction_id: str | None = None
     warn_counts: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     error: str | None = None
@@ -57,11 +67,21 @@ def load_prompt(name: str, shared: bool = True) -> str:
 
 
 def digest_version(llm: LLM) -> str:
-    """Changes whenever a prompt or model changes, so re-digests are explicit and comparable."""
+    """Changes whenever a prompt, the model, or the extraction code changes.
+
+    Chunking and parsing decide what the model ever sees, so they belong in the hash:
+    a chunk-size change that alters every note must mark sources stale like a prompt edit.
+    """
     h = hashlib.sha256()
     for p in sorted(PROMPTS.glob("*.md")):
         h.update(p.name.encode())
         h.update(p.read_bytes())
+    here = Path(__file__).parent
+    for name in CODE_FILES:
+        f = here / name
+        if f.exists():
+            h.update(name.encode())
+            h.update(f.read_bytes())
     h.update(llm.model_id.encode())
     return f"{PIPELINE_VERSION}-{h.hexdigest()[:8]}"
 
@@ -72,8 +92,15 @@ def source_uri(settings: Settings, project_id: str, source_id: str, name: str) -
 
 # --- register -----------------------------------------------------------------
 
-def register_file(ctx: Ctx, project_id: str, data: bytes, filename: str) -> tuple[Source, bool]:
-    """Store the bytes and create the Source. Never rejects a file. Returns (source, created)."""
+def register_file(ctx: Ctx, project_id: str, data: bytes, filename: str, *,
+                  document_id: str | None = None, revision_label: str | None = None,
+                  supersedes: str | None = None) -> tuple[Source, bool]:
+    """Store the bytes and create the Source. Never rejects a file. Returns (source, created).
+
+    `document_id` identifies the logical document across drafts. Superseding an earlier
+    source marks it, so retrieval can warn that some notes come from an old draft; it
+    does NOT transfer any confirmation, which is a human reconciliation.
+    """
     sid = hashlib.sha256(data).hexdigest()
     existing = ctx.store.get_source(project_id, sid)
     if existing is not None:
@@ -82,16 +109,36 @@ def register_file(ctx: Ctx, project_id: str, data: bytes, filename: str) -> tupl
     supported = mime in SUPPORTED_MIME
     uri = source_uri(ctx.settings, project_id, sid, "original" + extension_for(filename, mime))
     ctx.blobs.put(uri, data, mime)  # bytes first, so a Source never points at a missing object
+    prior = ctx.store.get_source(project_id, supersedes) if supersedes else None
+    if supersedes and prior is None:
+        raise KeyError(f"cannot supersede unknown source {supersedes}")
     src = Source(
         id=sid, filename=filename, mime_type=mime, kind=kind_for(mime), size_bytes=len(data),
         storage_path=uri, status="uploaded" if supported else "unsupported",
         error=None if supported else f"no v0 handler for {mime}",
+        document_id=document_id or (prior.document_id if prior else None),
+        revision_label=revision_label, supersedes_source_id=supersedes,
     )
     ctx.store.put_source(project_id, src)
+    if prior is not None:
+        ctx.store.put_source(project_id, prior.touch(superseded_by_source_id=sid))
     return src, True
 
 
 # --- worker ---------------------------------------------------------------------
+
+@contextmanager
+def ingest_lock(ctx: Ctx, project_id: str, holder: str = "cli"):
+    """Ingest runs one at a time per project. Replacing proposals is only safe while no
+    other run or review is writing; this makes that a check rather than a habit."""
+    token = ctx.store.acquire_lock(project_id, holder, LOCK_STALE_AFTER_S)
+    if token is None:
+        raise RuntimeError(f"another ingest is running for {project_id}; wait for it to finish")
+    try:
+        yield token
+    finally:
+        ctx.store.release_lock(project_id, token)
+
 
 def ingest_source(ctx: Ctx, project_id: str, source_id: str, *, force: bool = False) -> IngestReport:
     src = ctx.store.get_source(project_id, source_id)
@@ -106,15 +153,23 @@ def ingest_source(ctx: Ctx, project_id: str, source_id: str, *, force: bool = Fa
         report.status = "skipped"
         return report
 
+    extraction_id = new_id("ext")
+    report.extraction_id = extraction_id
     src = _update(ctx, project_id, src, status="digesting", error=None)
     try:
         data = ctx.blobs.get(src.storage_path)
-        job = _Job(ctx, project_id, src, version, EntityResolver(ctx.store.list_entities(project_id)), report.warnings)
+        job = _Job(ctx, project_id, src, version, EntityResolver(ctx.store.list_entities(project_id)),
+                   report.warnings, extraction_id)
         doc_type, derived, notes = job.run(data)
-        if job.scene_only:
-            report.warn_counts["scene_only_notes"] = job.scene_only
+        report.warnings.extend(job.resolver.apply_parents())
+        if job.unowned:
+            report.warn_counts["unowned_notes"] = job.unowned
+        # archive before anything is replaced: a later merge or rescope must never be able
+        # to erase what this source originally said
+        _archive(job, doc_type, notes)
         _commit(job, notes, report)
-        _update(ctx, project_id, src, status="digested", doc_type=doc_type, derived=derived, digest_version=version)
+        _update(ctx, project_id, src, status="digested", doc_type=doc_type, derived=derived,
+                digest_version=version, extraction_id=extraction_id)
         report.status, report.doc_type = "digested", doc_type
     except Exception as exc:  # the source records the failure; the batch carries on
         log.exception("ingest failed: %s", src.filename)
@@ -133,29 +188,72 @@ def _update(ctx: Ctx, project_id: str, src: Source, **changes) -> Source:
     return new
 
 
+def _archive(job: "_Job", doc_type: str, notes: list[Note]) -> None:
+    """One write per extraction. Keeps each candidate's own body, owner and applicability,
+    which is the material a later evidence split or dispute resolution needs."""
+    payload = {
+        "extraction_id": job.extraction_id,
+        "source_id": job.src.id,
+        "filename": job.src.filename,
+        "doc_type": doc_type,
+        "digest_version": job.version,
+        "created_at": utcnow().isoformat(),
+        "entities_created": [e.model_dump(mode="json") for e in job.resolver.new],
+        "candidates": [n.model_dump(mode="json") for n in notes],
+    }
+    uri = source_uri(job.settings, job.project_id, job.src.id,
+                     f"extractions/{job.extraction_id}/candidates.json")
+    job.ctx.blobs.put(uri, json.dumps(payload, indent=2).encode(), "application/json")
+
+
 def _commit(job: "_Job", notes: list[Note], report: IngestReport) -> None:
-    """Entities first, then swap this source's proposed notes for the new set.
-    Confirmed and rejected notes survive, and are not re-proposed verbatim."""
+    """Entities first, then reconcile this source's notes against what is already there.
+
+    A candidate whose assertion is unchanged keeps its existing id and its human decision:
+    a confirmed note stays confirmed, a rejected one is not proposed again. Only unmatched
+    machine proposals are replaced. Reviewed notes are never deleted.
+    """
     store, pid, sid = job.ctx.store, job.project_id, job.src.id
     if job.resolver.new:
         store.put_entities(pid, job.resolver.new)
-    existing = store.list_notes(pid, source_id=sid)
-    stale = [n.id for n in existing if n.status == "proposed" and n.author == "agent"
-             and (n.origin is None or n.origin.producer == "ingest")]
-    reviewed = {_body_key(n) for n in existing if n.status != "proposed"}
-    fresh = [n for n in _merge_duplicates(notes) if _body_key(n) not in reviewed]
+
+    existing = [n for n in store.list_notes(pid, source_id=sid)
+                if n.origin is None or n.origin.producer == "ingest"]
+    by_assertion: dict[tuple, Note] = {}
+    for n in existing:
+        by_assertion.setdefault(n.assertion, n)
+
+    write: list[Note] = []
+    matched: set[str] = set()
+    reused = 0
+    for candidate in _merge_duplicates(notes):
+        prior = by_assertion.get(candidate.assertion)
+        if prior is None:
+            write.append(candidate)
+            continue
+        matched.add(prior.id)
+        if prior.status != "proposed":
+            reused += 1          # the human decision stands; nothing to write
+            continue
+        write.append(candidate.model_copy(update={
+            "id": prior.id, "created_at": prior.created_at, "revision": prior.revision,
+        }))
+
+    stale = [n.id for n in existing
+             if n.id not in matched and n.status == "proposed" and n.author == "agent"]
     if stale:
         store.delete_notes(pid, stale)
-    if fresh:
-        store.put_notes(pid, fresh)
+    if write:
+        store.put_notes(pid, write)
     report.entities_created = len(job.resolver.new)
-    report.notes_written = len(fresh)
+    report.notes_written = len(write)
     report.notes_replaced = len(stale)
+    report.notes_reused = reused
 
 
 def _body_key(n: Note) -> tuple:
     page = n.provenance[0].page if n.kind == "reference_image" and n.provenance else None
-    return n.kind, " ".join(n.body.lower().split()), page
+    return (n.kind, *n.assertion, page)
 
 
 def _merge_duplicates(notes: list[Note]) -> list[Note]:
@@ -168,7 +266,7 @@ def _merge_duplicates(notes: list[Note]) -> list[Note]:
             continue
         m = merged[key]
         merged[key] = m.model_copy(update={
-            "scope_refs": list(dict.fromkeys(m.scope_refs + n.scope_refs)),
+            "mentions": list(dict.fromkeys(m.mentions + n.mentions)),
             "provenance": m.provenance if n.kind == "reference_image" else m.provenance + n.provenance,
         })
     return list(merged.values())
@@ -176,11 +274,12 @@ def _merge_duplicates(notes: list[Note]) -> list[Note]:
 
 class _Job:
     def __init__(self, ctx: Ctx, project_id: str, src: Source, version: str,
-                 resolver: EntityResolver, warnings: list[str]):
+                 resolver: EntityResolver, warnings: list[str], extraction_id: str):
         self.ctx, self.project_id, self.src, self.version = ctx, project_id, src, version
         self.resolver, self.warnings = resolver, warnings
         self.settings = ctx.settings
-        self.scene_only = 0
+        self.extraction_id = extraction_id
+        self.unowned = 0
 
     def warn(self, msg: str) -> None:
         log.warning("%s: %s", self.src.filename, msg)
@@ -263,7 +362,7 @@ class _Job:
             raise OutputTruncated(f"roster pass truncated for a {n}-page script; this needs a rolling "
                                   f"roster, which v0 does not have ({exc})") from exc
         for loc in roster.locations:
-            self.resolver.location(loc.name, loc.aliases, loc.existing_id)
+            self.resolver.location(loc.name, loc.aliases, loc.existing_id, loc.inside)
         for sc in roster.scenes:
             loc_ids = [i for ref in sc.locations if (i := self.resolver.location(ref))]
             self.resolver.scene(sc.number, heading=sc.heading, location_ids=loc_ids, create=True)
@@ -362,23 +461,28 @@ class _Job:
     def notes_from(self, out: NotesOut, *, page_offset: int, page_count: int | None,
                    references: bool = True, scene_scope: set[str] | None = None, label: str = "") -> list[Note]:
         for loc in out.locations:
-            self.resolver.location(loc.name, loc.aliases, loc.existing_id)
+            self.resolver.location(loc.name, loc.aliases, loc.existing_id, loc.inside)
         notes: list[Note] = []
         out_of_scope = 0
         for n in out.notes:
-            scope = self.scope(n.locations, n.scenes, n.project_wide)
-            if not scope:
-                self.warn(f"dropped unscoped note: {n.body[:80]!r}")
+            owner = self.owner(n.owner, n.project_wide)
+            if owner is None:
+                self.unowned += 1
+                self.warn(f"dropped note with no owner: {n.body[:80]!r}")
                 continue
-            if not n.project_wide and all(i.startswith("scn_") for i in scope):
-                # the prompt requires a location on every note; count these to see if it is obeyed
-                self.scene_only += 1
-            if scene_scope is not None:
-                scene_ids = {i for i in scope if i.startswith("scn_")}
-                if scene_ids and not scene_ids & scene_scope:
-                    out_of_scope += 1  # a neighbouring scene's excerpt owns this fact
-                    continue
-            if note := self.note(n.kind, n.body, scope, self.page(n.page, page_offset, page_count), n.quote):
+            scene_id = self.resolver.scene(n.only_during_scene) if n.only_during_scene else None
+            if n.only_during_scene and scene_id is None:
+                self.warn(f"unknown scene {n.only_during_scene!r}; note kept without the condition")
+            if scene_scope is not None and scene_id is not None and scene_id not in scene_scope:
+                out_of_scope += 1  # a neighbouring scene's excerpt owns this fact
+                continue
+            applicability = Applicability(
+                include_descendants=bool(n.applies_to_places_within) and owner != PROJECT_SCOPE,
+                scene_id=scene_id,
+            )
+            note = self.note(n.kind, n.body, owner, self.page(n.page, page_offset, page_count), n.quote,
+                             applicability=applicability, mentions=self.mentions(n.mentions, owner))
+            if note:
                 notes.append(note)
         if out_of_scope:
             self.warn(f"{label}: dropped {out_of_scope} notes about scenes outside the excerpt's scope")
@@ -393,24 +497,26 @@ class _Job:
         if page_count is not None and page is None:
             self.warn(f"dropped reference without a valid page: {r.caption[:80]!r}")
             return None
-        scope = self.scope(r.locations, [], False) or [PROJECT_SCOPE]
-        return self.note("reference_image", r.caption, scope, page, None)
+        owner = self.owner(r.location, not r.location) or PROJECT_SCOPE
+        return self.note("reference_image", r.caption, owner, page, None)
 
-    def scope(self, locations: list[str], scenes: list[str], project_wide: bool) -> list[str]:
-        ids: list[str] = []
-        for ref in locations:
-            if i := self.resolver.location(ref):
+    def owner(self, ref: str, project_wide: bool) -> str | None:
+        """One owner per note. A named place wins over the project_wide flag, because a
+        model that sets both is describing a place, not a production-wide rule."""
+        ref = (ref or "").strip()
+        if ref:
+            if owner_id := self.resolver.location(ref):
+                return owner_id
+            self.warn(f"owner {ref!r} is rejected or empty; note dropped")
+            return None
+        return PROJECT_SCOPE if project_wide else None
+
+    def mentions(self, refs: list[str], owner: str) -> list[str]:
+        ids = []
+        for ref in refs:
+            if (i := self.resolver.location(ref)) and i != owner and i not in ids:
                 ids.append(i)
-            else:
-                self.warn(f"location {ref!r} is rejected or empty; ignored")
-        for ref in scenes:
-            if i := self.resolver.scene(ref):
-                ids.append(i)
-            else:
-                self.warn(f"unknown scene {ref!r}; ignored")
-        if project_wide:
-            ids.append(PROJECT_SCOPE)
-        return list(dict.fromkeys(ids))
+        return ids
 
     def page(self, page: int | None, offset: int, count: int | None) -> int | None:
         if page is None or count is None:
@@ -421,16 +527,22 @@ class _Job:
         self.warn(f"page {page} (offset {offset}) outside 1-{count}; provenance page cleared")
         return None
 
-    def note(self, kind: str, body: str, scope: list[str], page: int | None, quote: str | None) -> Note | None:
+    def note(self, kind: str, body: str, owner: str, page: int | None, quote: str | None,
+             applicability: Applicability | None = None, mentions: list[str] | None = None) -> Note | None:
         body = body.strip()
         if not body:
             return None
         if len(body) > 2000:
             self.warn(f"note body truncated from {len(body)} chars")
             body = body[:2000]
+        applicability = applicability or Applicability()
         return Note(
-            kind=kind, body=body, scope_refs=scope, author="agent",
-            provenance=[Provenance(source_id=self.src.id, page=page, quote=(quote or "").strip()[:300] or None)],
+            kind=kind, body=body, owner_id=owner, applicability=applicability,
+            mentions=mentions or [], author="agent",
+            provenance=[Provenance(
+                source_id=self.src.id, page=page, quote=(quote or "").strip()[:300] or None,
+                extraction_id=self.extraction_id, extracted_body=body, extracted_owner_id=owner,
+            )],
             origin=NoteOrigin(producer="ingest", source_id=self.src.id, digest_version=self.version),
         )
 

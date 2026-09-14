@@ -1,7 +1,8 @@
 import pytest
 
 from harness.memory.models import (
-    PROJECT_SCOPE, Derived, Location, Note, NoteOrigin, Project, Provenance, Scene, Source,
+    PROJECT_SCOPE, Applicability, Containment, Derived, Location, Note, NoteOrigin, Project,
+    Provenance, Scene, Source,
 )
 from harness.memory.ports import MemoryStore
 from harness.memory.retrieval import (
@@ -14,194 +15,196 @@ IMG = "b" * 64
 LOOKBOOK = "c" * 64
 
 
-def note(body, scope, *, kind="description", status="proposed", source=SCRIPT, page=None, quote=None):
-    return Note(kind=kind, body=body, scope_refs=scope, status=status, author="agent",
+def note(body, owner, *, kind="description", status="proposed", source=SCRIPT, page=None,
+         quote=None, within=False, scene=None, mentions=(), reviewed=False):
+    extra = {}
+    if status != "proposed" or reviewed:
+        extra = dict(reviewed_revision=1, reviewed_by="vd")
+    return Note(kind=kind, body=body, owner_id=owner, status=status, author="agent",
+                applicability=Applicability(include_descendants=within, scene_id=scene),
+                mentions=list(mentions),
                 provenance=[Provenance(source_id=source, page=page, quote=quote)],
-                origin=NoteOrigin(source_id=source, digest_version="v"))
+                origin=NoteOrigin(digest_version="v", source_id=source),
+                review_reason="false" if status == "rejected" else None, **extra)
 
 
 @pytest.fixture
 def world():
+    """Devgram contains the market square and the lanes. The temple is across the river,
+    outside the village. Scene 7 is a dream that visits several of them."""
     store = MemoryStore()
     store.put_project(Project(id=PID, name="Dehleez"))
-    store.put_source(PID, Source(id=SCRIPT, filename="Dehleez_Ep1.pdf", mime_type="application/pdf",
-                                 kind="document", size_bytes=1, storage_path=f"gs://b/{SCRIPT}/original.pdf",
-                                 status="digested"))
-    store.put_source(PID, Source(id=IMG, filename="devgram_well/IMG_1.jpg", mime_type="image/jpeg",
-                                 kind="image", size_bytes=1, storage_path=f"gs://b/{IMG}/original.jpg",
-                                 status="digested"))
-    store.put_source(PID, Source(id=LOOKBOOK, filename="lookbook.pdf", mime_type="application/pdf",
-                                 kind="document", size_bytes=1, storage_path=f"gs://b/{LOOKBOOK}/original.pdf",
-                                 status="digested", derived=Derived(page_count=9, pages_prefix=f"gs://b/{LOOKBOOK}/pages/")))
+    for sid, name, kind, derived in [
+        (SCRIPT, "Dehleez_Ep1.pdf", "document", Derived()),
+        (IMG, "devgram_well/IMG_1.jpg", "image", Derived()),
+        (LOOKBOOK, "lookbook.pdf", "document", Derived(page_count=9, pages_prefix=f"gs://b/{LOOKBOOK}/pages/")),
+    ]:
+        store.put_source(PID, Source(id=sid, filename=name, mime_type="application/pdf" if kind == "document" else "image/jpeg",
+                                     kind=kind, size_bytes=1, storage_path=f"gs://b/{sid}/original.x",
+                                     status="digested", derived=derived))
 
-    well = Location(name="Devgram well", aliases=["the well"], status="confirmed", author="agent")
-    old = Location(name="Old well", status="merged", merged_into=well.id, author="agent")
-    older = Location(name="Kuan", status="merged", merged_into=old.id, author="agent")
-    court = Location(name="Temple courtyard", author="agent")
-    s1 = Scene(name="EXT. DEVGRAM WELL - NIGHT", number="1", location_ids=[old.id], author="agent")
-    s2 = Scene(name="EXT. TEMPLE COURTYARD - DAY", number="2", location_ids=[court.id], author="agent")
-    s10 = Scene(name="EXT. DEVGRAM WELL - DAWN", number="10", location_ids=[well.id], author="agent")
-    store.put_entities(PID, [well, old, older, court, s1, s2, s10])
+    devgram = Location(name="Devgram", aliases=["the village"], status="confirmed", author="user")
+    market = Location(name="Market Square", aliases=["Market"], status="confirmed", author="agent",
+                      containment=Containment(parent_id=devgram.id, status="confirmed"))
+    lanes = Location(name="Devgram Lanes", author="agent",
+                     containment=Containment(parent_id=devgram.id, status="proposed"))
+    temple = Location(name="Tree Temple", aliases=["the temple"], author="agent")
+    sanctum = Location(name="Inner Sanctum", author="agent",
+                       containment=Containment(parent_id=temple.id, status="confirmed"))
+    old_market = Location(name="Bazaar", status="merged", merged_into=market.id, author="agent")
+    s7 = Scene(name="INT./EXT. PANDIT'S DREAM - NIGHT", number="7",
+               location_ids=[market.id, temple.id], author="agent")
+    s10 = Scene(name="EXT. MARKET SQUARE - MORNING", number="10", location_ids=[market.id], author="agent")
+    store.put_entities(PID, [devgram, market, lanes, temple, sanctum, old_market, s7, s10])
 
-    n = {
-        "constraint": note("No electricity poles near the well.", [well.id], kind="constraint", status="confirmed", page=2),
-        "merged": note("Rope worn smooth.", [older.id], page=5),
-        "scene_only": note("A fissure opens in the tree beside the well.", [s1.id], page=1, quote="the ground splits"),
-        "both": note("Stone well, waist high.", [well.id, s1.id], page=1),
-        "rejected": note("Well is made of steel.", [well.id], status="rejected"),
-        "tone": note("Muted ochre palette.", [PROJECT_SCOPE], kind="tone", status="confirmed"),
-        "loose_ref": note("Unattributed dusk photo.", [PROJECT_SCOPE], kind="reference_image", source=IMG),
-        "photo": note("Well at dusk, rope coiled on the rim.", [well.id], kind="reference_image", source=IMG),
-        "page": note("Mud wall behind the well.", [well.id], kind="reference_image", source=LOOKBOOK, page=3),
-        "court": note("Slate floor, uneven.", [court.id, s2.id], page=3),
-        "dawn": note("Mist over the well at dawn.", [s10.id], page=9),
+    notes = {
+        "curfew": note("Streets empty after the evening bell.", devgram.id, kind="constraint",
+                       status="confirmed", within=True, page=2),
+        "houses": note("The village has three hundred houses.", devgram.id, page=2),
+        "grain": note("Grain is weighed on scales each morning.", market.id, page=15),
+        "merged": note("Stalls are roofed with corrugated sheet.", old_market.id, page=15),
+        "flood": note("Floodwater surges uphill through the square.", market.id, scene=s7.id, page=13),
+        "temple_roots": note("Stone walls absorbed by ancient roots.", temple.id, within=False, page=18),
+        "temple_rule": note("No idols or treasure anywhere in the temple.", temple.id,
+                            kind="constraint", within=True, page=13),
+        "bridge_ref": note("The temple is visible across the river.", market.id,
+                           mentions=[temple.id], page=4),
+        "rejected": note("The market is roofed in glass.", market.id, status="rejected"),
+        "tone": note("Muted ochre palette throughout.", PROJECT_SCOPE, kind="tone",
+                     status="confirmed"),
+        "loose_ref": note("Unattributed dusk photo.", PROJECT_SCOPE, kind="reference_image", source=IMG),
+        "photo": note("Well at dusk, rope coiled on the rim.", market.id, kind="reference_image", source=IMG),
+        "page_ref": note("Mud wall behind the stalls.", market.id, kind="reference_image",
+                         source=LOOKBOOK, page=3),
     }
-    store.put_notes(PID, list(n.values()))
-    return store, dict(well=well, old=old, older=older, court=court, s1=s1, s2=s2, s10=s10), n
+    store.put_notes(PID, list(notes.values()))
+    e = dict(devgram=devgram, market=market, lanes=lanes, temple=temple, sanctum=sanctum,
+             old_market=old_market, s7=s7, s10=s10)
+    return store, e, notes
 
 
 def ids(notes):
-    return [x.id for x in notes]
+    return [n.id for n in notes]
 
 
-def test_resolve_scope_by_id_name_alias_merged_and_scene_number(world):
+def test_resolve_scope(world):
     store, e, _ = world
-    well = e["well"].id
-    assert resolve_scope(store, PID, "Devgram well") == well
-    assert resolve_scope(store, PID, "the WELL") == well
-    assert resolve_scope(store, PID, "Kuan") == well              # merged twice
-    assert resolve_scope(store, PID, e["old"].id) == well
-    assert resolve_scope(store, PID, "Scene 1") == e["s1"].id
-    assert resolve_scope(store, PID, "project") == PROJECT_SCOPE
-    with pytest.raises(LookupError, match="did you mean: Devgram well"):
-        resolve_scope(store, PID, "Devgram wel")
+    assert resolve_scope(store, PID, "Market") == e["market"].id
+    assert resolve_scope(store, PID, "Bazaar") == e["market"].id          # merged
+    assert resolve_scope(store, PID, "Scene 7") == e["s7"].id
+    assert resolve_scope(store, PID, PROJECT_SCOPE) == PROJECT_SCOPE
+    with pytest.raises(LookupError, match="did you mean: Devgram"):
+        resolve_scope(store, PID, "Devgran")
 
 
-def test_location_pack(world):
+def test_owned_notes_only_and_merged_ids(world):
     store, e, n = world
-    pack = get_context(store, PID, "Devgram well")
-    assert pack.scope_id == e["well"].id
-    assert set(pack.merged_ids) == {e["old"].id, e["older"].id}
-    assert ids(pack.notes) == [n["constraint"].id, n["both"].id, n["merged"].id, n["page"].id, n["photo"].id]
-    assert n["rejected"].id not in ids(pack.notes + pack.related_notes + pack.project_notes)
-    assert [s.number for s in pack.scenes] == ["1", "10"]         # scene 1 links via a merged id; natural order
-    assert ids(pack.related_notes) == [n["scene_only"].id, n["dawn"].id]
-    assert pack.related_by == {e["s1"].id: [n["scene_only"].id], e["s10"].id: [n["dawn"].id]}
-    assert ids(pack.project_notes) == [n["tone"].id]             # unattributed images stay out
-    assert [r.uri for r in pack.reference_images] == [f"gs://b/{LOOKBOOK}/pages/0003.png", f"gs://b/{IMG}/original.jpg"]
-    assert pack.sources[SCRIPT] == "Dehleez_Ep1.pdf"
+    pack = get_context(store, PID, "Market")
+    assert ids(pack.notes) == [n["bridge_ref"].id, n["grain"].id, n["merged"].id,   # by page
+                               n["page_ref"].id, n["photo"].id]
+    assert pack.merged_ids == [e["old_market"].id]
+    assert n["rejected"].id not in ids(pack.notes)
+    # a note that merely mentions the temple is the market's note, not the temple's
+    assert n["bridge_ref"].id not in ids(get_context(store, PID, "Tree Temple").notes)
+
+
+def test_scene_conditional_notes_are_kept_separate(world):
+    store, e, n = world
+    pack = get_context(store, PID, "Market")
+    assert n["flood"].id not in ids(pack.notes)          # never the place's general state
+    assert [c.scene_id for c in pack.conditional] == [e["s7"].id]
+    assert ids(pack.conditional[0].notes) == [n["flood"].id]
+    assert pack.conditional[0].label.startswith("7 · ")
+    md = render_context_md(pack)
+    assert md.index("## Description") < md.index("## Only during these scenes")
+    assert "not the place's usual state" in md
+
+
+def test_confirmed_containment_inherits_only_marked_notes(world):
+    store, e, n = world
+    pack = get_context(store, PID, "Market")
+    assert [i.entity_id for i in pack.inherited] == [e["devgram"].id]
+    assert ids(pack.inherited[0].notes) == [n["curfew"].id]   # within=True
+    assert n["houses"].id not in ids(pack.inherited[0].notes)  # the parent's own extent
+    assert [a.name for a in pack.ancestors] == ["Devgram"]
+    assert "Inside: Devgram" in render_context_md(pack)
+
+
+def test_proposed_containment_does_not_inherit(world):
+    store, e, n = world
+    pack = get_context(store, PID, "Devgram Lanes")
+    assert pack.inherited == [] and pack.ancestors == []
+    assert n["curfew"].id not in ids(pack.notes)
+
+
+def test_notes_do_not_cross_to_an_unrelated_location(world):
+    """The temple is across the river, so the village curfew must not reach it, and the
+    temple's own rule must not reach the village."""
+    store, e, n = world
+    temple = get_context(store, PID, "Tree Temple")
+    assert n["curfew"].id not in ids(temple.notes + [x for i in temple.inherited for x in i.notes])
+    devgram = get_context(store, PID, "Devgram")
+    assert n["temple_rule"].id not in ids(devgram.notes)
+    assert devgram.inherited == []
+
+
+def test_inheritance_chains_through_two_levels(world):
+    store, e, n = world
+    pack = get_context(store, PID, "Inner Sanctum")
+    assert [i.name for i in pack.inherited] == ["Tree Temple"]
+    assert ids(pack.inherited[0].notes) == [n["temple_rule"].id]
+    assert n["temple_roots"].id not in ids(pack.inherited[0].notes)
+
+
+def test_scene_pack_lists_locations_without_borrowing_their_notes(world):
+    store, e, n = world
+    pack = get_context(store, PID, "Scene 7")
+    assert ids(pack.notes) == []                       # scene owns nothing itself
+    assert {l.name for l in pack.locations} == {"Market Square", "Tree Temple"}
+    assert n["grain"].id not in ids(pack.notes)
 
 
 def test_confirmed_only_pack(world):
     store, _, n = world
-    pack = get_context(store, PID, "Devgram well", include_proposed=False)
-    assert ids(pack.notes) == [n["constraint"].id]
-    assert pack.related_notes == [] and pack.reference_images == []
+    pack = get_context(store, PID, "Devgram", include_proposed=False)
+    assert ids(pack.notes) == [n["curfew"].id]
     assert ids(pack.project_notes) == [n["tone"].id]
+    assert "Confirmed notes only." in render_context_md(pack)
 
 
-def test_scene_pack_pulls_location_context_through_merges(world):
-    store, e, n = world
-    pack = get_context(store, PID, "1")
-    assert ids(pack.notes) == [n["scene_only"].id, n["both"].id]
-    assert [l.id for l in pack.locations] == [e["well"].id]
-    assert set(ids(pack.related_notes)) == {n["constraint"].id, n["merged"].id, n["page"].id, n["photo"].id}
-    assert set(pack.related_by[e["well"].id]) == set(ids(pack.related_notes))
-    assert len(pack.reference_images) == 2
-
-
-def test_project_pack_includes_unattributed_images(world):
+def test_project_pack_holds_unattributed_images(world):
     store, _, n = world
     pack = get_context(store, PID, PROJECT_SCOPE)
     assert set(ids(pack.notes)) == {n["tone"].id, n["loose_ref"].id}
-    assert [r.note_id for r in pack.reference_images] == [n["loose_ref"].id]  # triage view for unattributed images
-    md = render_context_md(pack)
-    assert md.startswith("# Project-wide context") and "## Reference images" in md and "## Tone" in md
+    assert [r.note_id for r in pack.reference_images] == [n["loose_ref"].id]
 
 
-def test_render_context_md(world):
+def test_reference_images_resolve_to_uris(world):
+    store, _, n = world
+    pack = get_context(store, PID, "Market")
+    assert [r.uri for r in pack.reference_images] == [
+        f"gs://b/{LOOKBOOK}/pages/0003.png", f"gs://b/{IMG}/original.x"]
+    assert "## Reference images" in render_context_md(pack)
+
+
+def test_superseded_sources_are_flagged(world):
     store, e, n = world
-    md = render_context_md(get_context(store, PID, "Devgram well"))
-    assert md.startswith("# Devgram well\nLocation · `")
-    assert "Also called: the well" in md and "Merged in:" in md
-    assert md.index("## Constraints") < md.index("## Description") < md.index("## Reference images")
-    assert "- No electricity poles near the well. _(Dehleez_Ep1.pdf p.2)_" in md
-    assert "- [proposed] Stone well, waist high." in md
-    assert '_(Dehleez_Ep1.pdf p.1: "the ground splits")_' in md
-    assert "### 1 · EXT. DEVGRAM WELL - NIGHT" in md and "### 10 · EXT. DEVGRAM WELL - DAWN" in md
-    assert f"<!-- {n['both'].id} -->" in md
-    assert "steel" not in md and "Unattributed dusk photo" not in md
-    assert md.rstrip().endswith(f"<!-- {n['tone'].id} -->")
-
-    scene_md = render_context_md(get_context(store, PID, "Scene 1"))
-    assert "## Set in" in scene_md and "## Location context" in scene_md and "### Devgram well" in scene_md
+    old = store.get_source(PID, SCRIPT)
+    store.put_source(PID, old.touch(superseded_by_source_id="d" * 64))
+    md = render_context_md(get_context(store, PID, "Market"))
+    assert "superseded drafts: Dehleez_Ep1.pdf" in md
+    assert "not been reconciled" in md
 
 
 def test_index_and_export(world, tmp_path):
     store, e, _ = world
     index = render_index_md(store, PID)
-    assert "## Locations (2)" in index and "## Scenes (3)" in index
-    assert f"- Devgram well `{e['well'].id}` · confirmed · 5 notes · 2 scenes · aka the well" in index
-    assert "Old well" not in index
-    assert "- 1 note, 1 unattributed reference image" in index
+    assert "## Locations (5)" in index and "## Scenes (2)" in index
+    assert "inside Devgram ·" in index and "inside Devgram (proposed)" in index
+    assert "Bazaar" not in index
 
     paths = export_context(store, PID, tmp_path)
     names = sorted(p.relative_to(tmp_path).as_posix() for p in paths)
-    assert names[:2] == ["INDEX.md", "locations/devgram-well--" + e["well"].id + ".md"]
-    assert any(p.startswith("scenes/10-ext-devgram-well-dawn--") for p in names)
-    assert len(names) == 2 + 2 + 3
-
-
-# --- scene notes stay with the location that owns them --------------------------
-
-@pytest.fixture
-def dream(world):
-    """Scene 7 is set at two locations, as a dream sequence would be."""
-    store, e, n = world
-    s7 = Scene(name="INT./EXT. PANDIT'S DREAM - NIGHT", number="7",
-               location_ids=[e["well"].id, e["court"].id], author="agent")
-    store.put_entities(PID, [s7])
-    notes = {
-        "well_owned": note("Water climbs the well rim.", [e["well"].id, s7.id], page=13),
-        "court_owned": note("Slate floor vanishes under water.", [e["court"].id, s7.id], page=13),
-        "merged_owned": note("The old rope floats free.", [e["older"].id, s7.id], page=13),
-        "unowned": note("The bell rings with no sound.", [s7.id], page=13),
-    }
-    store.put_notes(PID, list(notes.values()))
-    return store, e, {**n, **notes}, s7
-
-
-def test_scene_note_owned_by_another_location_is_excluded(dream):
-    store, e, n, s7 = dream
-    well = get_context(store, PID, e["well"].id)
-    court = get_context(store, PID, e["court"].id)
-
-    assert n["court_owned"].id not in ids(well.related_notes)   # belongs to the courtyard
-    assert n["well_owned"].id in ids(well.notes)                # its own note, direct scope
-    assert n["merged_owned"].id in ids(well.notes)              # merged ids count as its own
-    assert n["well_owned"].id not in ids(court.related_notes)
-    assert n["court_owned"].id in ids(court.notes)
-
-
-def test_scene_note_with_no_location_appears_in_every_location_pack(dream):
-    store, e, n, s7 = dream
-    for loc in (e["well"].id, e["court"].id):
-        pack = get_context(store, PID, loc)
-        assert n["unowned"].id in ids(pack.related_notes)
-        assert pack.related_by[s7.id] == [n["unowned"].id]
-
-
-def test_scene_pack_excludes_notes_owned_by_another_scene(dream):
-    store, e, n, s7 = dream
-    pack = get_context(store, PID, s7.id)
-    assert n["scene_only"].id not in ids(pack.related_notes)    # scoped to scene 1
-    assert n["constraint"].id in ids(pack.related_notes)        # location-only note
-    assert n["both"].id not in ids(pack.related_notes)          # scoped to scene 1 as well
-
-
-def test_related_by_never_points_at_a_filtered_note(dream):
-    store, e, n, s7 = dream
-    for scope in (e["well"].id, e["court"].id, s7.id, "1"):
-        pack = get_context(store, PID, scope)
-        present = set(ids(pack.related_notes))
-        assert all(i in present for members in pack.related_by.values() for i in members)
+    assert names[0] == "INDEX.md"
+    assert sum(p.startswith("locations/") for p in names) == 5
+    assert sum(p.startswith("scenes/") for p in names) == 2

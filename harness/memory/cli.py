@@ -9,6 +9,10 @@
   harness-memory export <project_id> ./context_export [--confirmed-only]
   harness-memory references <project_id> "Devgram well" [--dry-run]
   harness-memory merge <project_id> "Approach Road" "Village Road" [--dry-run]
+  harness-memory confirm <project_id> <note_id> [--by NAME]
+  harness-memory reject <project_id> <note_id> --reason wrong_scope [--duplicate-of NOTE_ID]
+  harness-memory set-parent <project_id> "Market Square" "Devgram" [--by NAME]
+  harness-memory confirm-parent <project_id> "Market Square" [--by NAME]
 """
 from __future__ import annotations
 
@@ -19,9 +23,9 @@ from collections import Counter
 from pathlib import Path
 
 from .config import Settings
-from .ingest import Ctx, IngestReport, ingest_source, register_file
+from .ingest import Ctx, IngestReport, ingest_lock, ingest_source, register_file
 from .models import Location, Project, Scene
-from .curate import merge_entities
+from .curate import merge_entities, review_containment, review_note
 from .references import RefCtx, ReferenceReport, suggest_references
 from .retrieval import export_context, get_context, render_context_md, render_index_md
 
@@ -99,6 +103,8 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("project_id")
     d.add_argument("paths", nargs="+")
     d.add_argument("--no-ingest", action="store_true")
+    d.add_argument("--supersedes", help="sha256 of the draft this file replaces")
+    d.add_argument("--revision", help='label for this draft, e.g. "Draft 3"')
     i = sub.add_parser("ingest")
     i.add_argument("project_id")
     i.add_argument("--source")
@@ -123,6 +129,26 @@ def main(argv: list[str] | None = None) -> int:
     mg.add_argument("source", help="the duplicate to fold away (id, name, or alias)")
     mg.add_argument("target", help="the entity to keep")
     mg.add_argument("--dry-run", action="store_true", help="print what would change, write nothing")
+    cf = sub.add_parser("confirm")
+    cf.add_argument("project_id")
+    cf.add_argument("note_id")
+    cf.add_argument("--by", default="user")
+    rj = sub.add_parser("reject")
+    rj.add_argument("project_id")
+    rj.add_argument("note_id")
+    rj.add_argument("--reason", choices=["false", "wrong_scope", "duplicate", "not_useful", "other"])
+    rj.add_argument("--duplicate-of", help="the surviving note id; implies --reason duplicate")
+    rj.add_argument("--by", default="user")
+    sp = sub.add_parser("set-parent")
+    sp.add_argument("project_id")
+    sp.add_argument("child")
+    sp.add_argument("parent")
+    sp.add_argument("--by", default="user")
+    cp = sub.add_parser("confirm-parent")
+    cp.add_argument("project_id")
+    cp.add_argument("child")
+    cp.add_argument("--reject", action="store_true")
+    cp.add_argument("--by", default="user")
     ex = sub.add_parser("export")
     ex.add_argument("project_id")
     ex.add_argument("out_dir")
@@ -131,7 +157,8 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     settings = Settings.from_env()
-    store_only = args.cmd in ("status", "index", "context", "export", "merge")
+    store_only = args.cmd in ("status", "index", "context", "export", "merge",
+                              "confirm", "reject", "set-parent", "confirm-parent")
     if args.cmd == "references":
         ctx = None
         ref_ctx = build_ref_ctx(settings)
@@ -187,6 +214,32 @@ def main(argv: list[str] | None = None) -> int:
         print(result.summary())
         return 0
 
+    if args.cmd in ("confirm", "reject"):
+        try:
+            result = review_note(store, args.project_id, args.note_id,
+                                 "confirmed" if args.cmd == "confirm" else "rejected",
+                                 reviewer=args.by, reason=getattr(args, "reason", None),
+                                 duplicate_of=getattr(args, "duplicate_of", None))
+        except (LookupError, ValueError) as exc:
+            print(exc, file=sys.stderr)
+            return 1
+        print(result.summary())
+        return 0
+
+    if args.cmd in ("set-parent", "confirm-parent"):
+        parent = getattr(args, "parent", None)
+        decision = "rejected" if getattr(args, "reject", False) else "confirmed"
+        try:
+            loc = review_containment(store, args.project_id, args.child, decision,
+                                     reviewer=args.by, parent_ref=parent)
+        except (LookupError, ValueError) as exc:
+            print(exc, file=sys.stderr)
+            return 1
+        target = store.get_entity(args.project_id, loc.containment.parent_id)
+        print(f"{loc.name} `{loc.id}` inside {target.name if target else loc.containment.parent_id} "
+              f"· {loc.containment.status}")
+        return 0
+
     if args.cmd == "export":
         paths = export_context(store, args.project_id, args.out_dir, include_proposed=not args.confirmed_only)
         print(f"wrote {len(paths)} files to {args.out_dir}")
@@ -194,21 +247,27 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "drop":
         ids = []
+        if args.supersedes and len(args.paths) != 1:
+            print("--supersedes applies to a single file", file=sys.stderr)
+            return 1
         for path, name in iter_files(args.paths):
-            src, created = register_file(ctx, args.project_id, path.read_bytes(), name)
+            src, created = register_file(ctx, args.project_id, path.read_bytes(), name,
+                                         revision_label=args.revision, supersedes=args.supersedes)
             print(f"{'new' if created else 'known':<5} {src.status:<11} {name}")
             ids.append(src.id)
         if not args.no_ingest:
-            for sid in dict.fromkeys(ids):
-                print_report(ingest_source(ctx, args.project_id, sid))
+            with ingest_lock(ctx, args.project_id):
+                for sid in dict.fromkeys(ids):
+                    print_report(ingest_source(ctx, args.project_id, sid))
         return 0
 
     if args.cmd == "ingest":
         sources = ([ctx.store.get_source(args.project_id, args.source)] if args.source
                    else ctx.store.list_sources(args.project_id))
-        for src in sources:
-            if src is not None:
-                print_report(ingest_source(ctx, args.project_id, src.id, force=args.force))
+        with ingest_lock(ctx, args.project_id):
+            for src in sources:
+                if src is not None:
+                    print_report(ingest_source(ctx, args.project_id, src.id, force=args.force))
         return 0
 
     if args.cmd == "status":
@@ -218,7 +277,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Sources ({len(sources)})")
         for s in sorted(sources, key=lambda s: s.filename):
             print(f"  {s.status:<11} {s.doc_type or '-':<9} {s.filename}" + (f"  ! {s.error}" if s.error else ""))
-        per_scope = Counter(ref for n in notes if n.status != "rejected" for ref in n.scope_refs)
+        per_scope = Counter(n.owner_id for n in notes if n.status != "rejected")
         print(f"\nLocations")
         for e in sorted((e for e in entities if isinstance(e, Location)), key=lambda e: e.name.lower()):
             print(f"  {e.id}  {e.status:<9} {per_scope[e.id]:>3} notes  {e.name}"

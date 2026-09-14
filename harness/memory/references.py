@@ -216,7 +216,7 @@ def _vocabulary_note(scope_id: str, version: str, vocab: VocabularyOut,
     lines.append("Verified terms: " + "; ".join(
         f"{term} ({by_term[term].kind})" if term in by_term else term for term, _ in verified))
     return Note(
-        kind="vocabulary", body="\n".join(lines)[:2000], scope_refs=[scope_id], author="agent",
+        kind="vocabulary", body="\n".join(lines)[:2000], owner_id=scope_id, author="agent",
         provenance=[Provenance(url=hit.url, title=hit.title) for _, hit in verified[:8]],
         origin=NoteOrigin(producer=PRODUCER, scope=scope_id, digest_version=version),
     )
@@ -235,14 +235,14 @@ def _write(ctx: RefCtx, project_id: str, scope_id: str, version: str, vocab: Voc
                 report.warn(f"image {i} could not be stored; skipped")
                 continue
             notes.append(Note(
-                kind="reference_image", body=captions[i][:2000], scope_refs=[scope_id],
+                kind="reference_image", body=captions[i][:2000], owner_id=scope_id,
                 author="agent", group=group[:300],
                 provenance=[Provenance(source_id=src.id, url=hits[i].page_url or None,
                                        title=hits[i].title or None)],
                 origin=NoteOrigin(producer=PRODUCER, scope=scope_id, digest_version=version),
             ))
 
-    existing = [n for n in ctx.store.notes_for_scopes(project_id, [scope_id])
+    existing = [n for n in ctx.store.notes_for_owners(project_id, [scope_id])
                 if n.origin and n.origin.producer == PRODUCER and n.origin.scope == scope_id]
     stale = [n.id for n in existing if n.status == "proposed"]
     reviewed = {_key(n) for n in existing if n.status != "proposed"}

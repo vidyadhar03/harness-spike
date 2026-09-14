@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .models import Location, Scene, utcnow
+from .models import Containment, Location, Note, RejectReason, ReviewStatus, Scene, utcnow
 from .ports import EntityDoc, Store
 from .resolver import norm
 from .retrieval import _Graph, resolve_scope
@@ -47,7 +47,7 @@ def merge_entities(store: Store, project_id: str, source_ref: str, target_ref: s
         raise ValueError(f"{target.name} already merges into {source.name}; merging would make a cycle")
 
     own = graph.own_ids(source_id)
-    notes = store.notes_for_scopes(project_id, own) if own else []
+    notes = store.notes_for_owners(project_id, own) if own else []
 
     existing = {norm(target.name)} | {norm(a) for a in target.aliases}
     added: list[str] = []
@@ -61,12 +61,9 @@ def merge_entities(store: Store, project_id: str, source_ref: str, target_ref: s
     if dry_run:
         return result
 
-    updates: list[EntityDoc] = [
-        source.model_copy(update={"status": "merged", "merged_into": target_id, "updated_at": utcnow()})
-    ]
+    updates: list[EntityDoc] = [source.touch(status="merged", merged_into=target_id)]
     if added:
-        updates.append(target.model_copy(update={"aliases": [*target.aliases, *added],
-                                                 "updated_at": utcnow()}))
+        updates.append(target.touch(aliases=[*target.aliases, *added]))
     store.put_entities(project_id, updates)
     result.applied = True
     return result
@@ -74,3 +71,98 @@ def merge_entities(store: Store, project_id: str, source_ref: str, target_ref: s
 
 def _kind(entity: EntityDoc) -> str:
     return "location" if isinstance(entity, Location) else "scene"
+
+
+# --- note review ---------------------------------------------------------------------
+
+@dataclass
+class ReviewResult:
+    note: Note
+    action: str
+
+    def summary(self) -> str:
+        head = " ".join(self.note.body.split())[:70]
+        extra = f" (duplicate of {self.note.duplicate_of})" if self.note.duplicate_of else ""
+        return f"{self.action} `{self.note.id}`{extra}: {head}"
+
+
+def _get_note(store: Store, project_id: str, note_id: str) -> Note:
+    for n in store.list_notes(project_id):
+        if n.id == note_id:
+            return n
+    raise LookupError(f"no note with id {note_id!r}")
+
+
+def review_note(store: Store, project_id: str, note_id: str, decision: ReviewStatus, *,
+                reviewer: str, reason: RejectReason | None = None,
+                duplicate_of: str | None = None) -> ReviewResult:
+    """Record a human decision about one note.
+
+    The decision applies to a specific revision of (body, owner, applicability). If that
+    assertion later changes, `review_is_current` goes false rather than the approval
+    silently carrying over to text nobody agreed to.
+    """
+    note = _get_note(store, project_id, note_id)
+    if decision not in ("confirmed", "rejected"):
+        raise ValueError("decision must be 'confirmed' or 'rejected'")
+    if duplicate_of is not None:
+        if decision != "rejected":
+            raise ValueError("only a rejected note can be a duplicate of another")
+        survivor = _get_note(store, project_id, duplicate_of)
+        if survivor.id == note.id:
+            raise ValueError("a note cannot be a duplicate of itself")
+        reason = "duplicate"
+    if decision == "rejected" and reason is None:
+        raise ValueError("rejecting a note needs a reason: false, wrong_scope, duplicate, "
+                         "not_useful, other")
+
+    updated = note.touch(status=decision, reviewed_revision=note.revision, reviewed_by=reviewer,
+                         reviewed_at=utcnow(), review_reason=reason if decision == "rejected" else None,
+                         duplicate_of=duplicate_of)
+    store.put_notes(project_id, [updated])
+    return ReviewResult(note=updated, action=decision)
+
+
+def review_containment(store: Store, project_id: str, child_ref: str, decision: ReviewStatus, *,
+                       reviewer: str, parent_ref: str | None = None) -> Location:
+    """Confirm, reject, or set the parent of a location.
+
+    Only confirmed containment inherits notes downward, so this is the gate between a
+    machine's guess about the world's shape and facts flowing into a child's context.
+    """
+    graph = _Graph(store.list_entities(project_id))
+    child_id = resolve_scope(store, project_id, child_ref, graph)
+    child = graph.by_id[child_id]
+    if not isinstance(child, Location):
+        raise ValueError(f"{child_ref!r} is a scene; containment is between locations")
+
+    if parent_ref is not None:
+        parent_id = resolve_scope(store, project_id, parent_ref, graph)
+        parent = graph.by_id[parent_id]
+        if not isinstance(parent, Location):
+            raise ValueError(f"{parent_ref!r} is a scene; a location's parent must be a location")
+        if parent_id == child_id:
+            raise ValueError("a location cannot contain itself")
+        if _would_cycle(graph, child_id, parent_id):
+            raise ValueError(f"{parent.name} is already inside {child.name}; that would make a cycle")
+        containment = Containment(parent_id=parent_id)
+    elif child.containment is None:
+        raise ValueError(f"{child.name} has no proposed parent; pass one to set it")
+    else:
+        containment = child.containment
+
+    updated = child.touch(containment=containment.model_copy(update={
+        "status": decision, "reviewed_by": reviewer, "reviewed_at": utcnow()}))
+    store.put_entities(project_id, [updated])
+    return updated
+
+
+def _would_cycle(graph: _Graph, child_id: str, parent_id: str) -> bool:
+    seen, node = {child_id}, graph.by_id.get(parent_id)
+    while isinstance(node, Location) and node.containment is not None:
+        nxt = node.containment.parent_id
+        if nxt in seen:
+            return True
+        seen.add(node.id)
+        node = graph.by_id.get(nxt)
+    return False

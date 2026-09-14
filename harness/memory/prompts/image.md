@@ -5,6 +5,6 @@ The attachment is one image from the memory dump: a location photo, recce shot, 
 - If the image is mainly text (handwritten notes, a printed page, a whiteboard), leave references empty and write notes from the text instead.
 - Otherwise add exactly one references entry:
   - caption: 1 to 3 sentences of concrete visual description: what the place is, layout, materials, condition, light, time of day, and scale cues.
-  - locations: the known location(s) this image shows. The filename and its folder path are strong evidence ("devgram_well/IMG_0012.jpg" shows Devgram well). Propose a new location only when the path or visible signage names one. Leave the list empty otherwise.
+  - location: the one known location this image shows. The filename and its folder path are strong evidence ("devgram_well/IMG_0012.jpg" shows Devgram well). Propose a new location only when the path or visible signage names one. Leave it empty otherwise.
   - page: null.
 - notes: only for details the caption would lose that a later step needs as a separate fact, such as readable signage or a distinctive architectural feature. Usually none. page stays null.

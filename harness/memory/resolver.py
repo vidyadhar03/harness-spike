@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 
-from .models import Location, Scene
+from .models import Containment, Location, Scene
 from .ports import EntityDoc
 
 _ARTICLE = re.compile(r"^(the|a|an)\s+")
@@ -30,6 +30,7 @@ class EntityResolver:
         self._scene: dict[str, str] = {}
         self._rejected: set[str] = set()
         self.new: list[EntityDoc] = []
+        self.pending_parents: list[tuple[str, str]] = []
         for e in existing:
             self._index(e)
 
@@ -65,7 +66,8 @@ class EntityResolver:
         self.new.append(e)
         self._index(e)
 
-    def location(self, ref: str, aliases: list[str] | tuple = (), existing_id: str | None = None) -> str | None:
+    def location(self, ref: str, aliases: list[str] | tuple = (), existing_id: str | None = None,
+                 inside: str | None = None) -> str | None:
         for candidate in (existing_id, ref):
             if candidate and isinstance(self._by_id.get(candidate), Location):
                 target = self._target(candidate)
@@ -82,7 +84,39 @@ class EntityResolver:
         extra = list(dict.fromkeys(a.strip() for a in aliases if a.strip() and norm(a) != key))
         loc = Location(name=ref.strip(), aliases=extra, author="agent")
         self._add(loc)
+        if inside:
+            self.pending_parents.append((loc.id, inside))
         return loc.id
+
+    def apply_parents(self) -> list[str]:
+        """Resolve proposed containment once every location exists. Parents are proposed,
+        never confirmed: retrieval ignores them until a human confirms."""
+        warnings: list[str] = []
+        for child_id, parent_ref in self.pending_parents:
+            child = self._by_id.get(child_id)
+            if not isinstance(child, Location) or child.containment is not None:
+                continue
+            parent_id = self.location(parent_ref)
+            if parent_id is None or parent_id == child_id or self._would_cycle(child_id, parent_id):
+                warnings.append(f"ignored containment {child.name!r} inside {parent_ref!r}")
+                continue
+            updated = child.touch(containment=Containment(parent_id=parent_id))
+            self._by_id[child_id] = updated
+            for i, e in enumerate(self.new):
+                if e.id == child_id:
+                    self.new[i] = updated
+                    break
+        self.pending_parents.clear()
+        return warnings
+
+    def _would_cycle(self, child_id: str, parent_id: str) -> bool:
+        seen, node = {child_id}, self._by_id.get(parent_id)
+        while isinstance(node, Location) and node.containment is not None:
+            if node.containment.parent_id in seen:
+                return True
+            seen.add(node.id)
+            node = self._by_id.get(node.containment.parent_id)
+        return False
 
     def scene(self, ref: str, *, heading: str | None = None, location_ids: list[str] | tuple = (),
               create: bool = False) -> str | None:
