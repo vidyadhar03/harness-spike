@@ -118,6 +118,9 @@ class OutCaption(Out):
     facet: Literal["place", "architecture", "material", "terrain"] = "place"
 
 
+class CaptionsOut(Out):
+    captions: list[OutCaption] = []
+
+
 class CurateOut(Out):
     directions: list[OutDirection] = []
-    captions: list[OutCaption] = []

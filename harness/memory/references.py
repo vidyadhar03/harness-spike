@@ -20,9 +20,9 @@ from .config import Settings
 from .files import extension_for
 from .ingest import PROMPTS, load_prompt, source_uri
 from .models import Location, Note, NoteOrigin, Provenance, Source
-from .ports import LLM, Blob, Blobs, ImageHit, Images, Store, T, Text, TermHit
+from .ports import LLM, Blob, Blobs, ImageHit, Images, OutputTruncated, Store, T, Text, TermHit
 from .retrieval import get_context, render_context_md, resolve_scope
-from .schemas import CurateOut, VocabularyOut
+from .schemas import CaptionsOut, CurateOut, VocabularyOut
 
 log = logging.getLogger(__name__)
 
@@ -30,7 +30,8 @@ PRODUCER = "references"
 UNSORTED = "Unsorted"
 FACET_LABELS = {"place": "Place", "terrain": "Terrain",
                 "architecture": "Architecture", "material": "Material"}
-REFERENCES_VERSION = "references-v1"
+REFERENCES_VERSION = "references-v2"
+CAPTION_BATCH = 8          # images per captioning call; halved on truncation
 
 
 @dataclass
@@ -65,7 +66,7 @@ class ReferenceReport:
 
 def references_version(llm: LLM) -> str:
     h = hashlib.sha256()
-    for name in ("_shared.md", "vocabulary.md", "curate_references.md"):
+    for name in ("_shared.md", "vocabulary.md", "caption_references.md", "group_references.md"):
         h.update((PROMPTS / name).read_bytes())
     h.update(llm.model_id.encode())
     return f"{REFERENCES_VERSION}-{h.hexdigest()[:8]}"
@@ -163,32 +164,77 @@ def _retrieve(ctx: RefCtx, verified: list[tuple[str, TermHit]], per_term: int, m
     return out
 
 
-def _curate(ctx: RefCtx, context_md: str, hits: list[ImageHit], report: ReferenceReport
-            ) -> tuple[list[tuple[str, str, list[int]]], dict[int, str], dict[int, str]]:
-    parts = [Text(context_md), Text(f"{len(hits)} candidate images follow.")]
-    usable: list[int] = []
-    for i, hit in enumerate(hits):
+def _caption(ctx: RefCtx, context_md: str, hits: list[ImageHit], indices: list[int],
+             report: ReferenceReport) -> tuple[dict[int, str], dict[int, str]]:
+    """Caption one batch of images, splitting and retrying if the model runs out of budget.
+
+    Thinking tokens share the output budget, so a large batch can truncate before any
+    answer is written. Halving is always safe: captioning one image never depends on
+    seeing the others.
+    """
+    parts: list = [Text(context_md), Text(f"{len(indices)} candidate images follow.")]
+    present: list[int] = []
+    for i in indices:
+        hit = hits[i]
         try:
             data = ctx.images.fetch(hit.preview_url)
         except Exception as exc:
             report.warn(f"could not fetch image {i} ({hit.title}): {exc}")
             continue
-        usable.append(i)
+        present.append(i)
         parts.append(Text(f"[{i}] {hit.title}" + (f" — {hit.description}" if hit.description else "")))
         parts.append(Blob(data, hit.mime_type))
-    if not usable:
-        return [], {}, {}
+    if not present:
+        return {}, {}
 
-    out = ctx.llm.generate(system=load_prompt("curate_references"), parts=parts, schema=CurateOut)
-    captions = {c.index: c.caption.strip() for c in out.captions if c.index in set(usable) and c.caption.strip()}
-    # what each image is a reference FOR: a place to stand in for the location, or only its
-    # architecture, material or terrain. An image from another country with the right stone
-    # is a good material reference and a bad place reference.
+    try:
+        out = ctx.llm.generate(system=load_prompt("caption_references"), parts=parts,
+                               schema=CaptionsOut)
+    except OutputTruncated as exc:
+        if len(present) == 1:
+            report.warn(f"image {present[0]} could not be captioned within the output budget; skipped")
+            return {}, {}
+        mid = len(present) // 2
+        report.warn(f"captioning {len(present)} images truncated; split into "
+                    f"{mid} and {len(present) - mid} and retried")
+        left_c, left_f = _caption(ctx, context_md, hits, present[:mid], report)
+        right_c, right_f = _caption(ctx, context_md, hits, present[mid:], report)
+        return {**left_c, **right_c}, {**left_f, **right_f}
+
+    keep = set(present)
+    captions = {c.index: c.caption.strip() for c in out.captions
+                if c.index in keep and c.caption.strip()}
     facets = {c.index: c.facet for c in out.captions if c.index in captions}
-    uncaptioned = [i for i in usable if i not in captions]
+    return captions, facets
+
+
+def _curate(ctx: RefCtx, context_md: str, hits: list[ImageHit], report: ReferenceReport
+            ) -> tuple[list[tuple[str, str, list[int]]], dict[int, str], dict[int, str]]:
+    """Caption in bounded batches, then group the captions in one text-only call.
+
+    Captioning is per-image work that scales with the candidate count; grouping is one
+    small judgement over text. Keeping them apart stops the whole pass from growing with
+    the number of images retrieved.
+    """
+    captions: dict[int, str] = {}
+    facets: dict[int, str] = {}
+    order = list(range(len(hits)))
+    for start in range(0, len(order), CAPTION_BATCH):
+        batch_c, batch_f = _caption(ctx, context_md, hits, order[start:start + CAPTION_BATCH], report)
+        captions.update(batch_c)
+        facets.update(batch_f)
+
+    uncaptioned = [i for i in order if i not in captions]
     if uncaptioned:
         report.warn(f"{len(uncaptioned)} image(s) judged irrelevant and left uncaptioned: "
                     + ", ".join(hits[i].title[:40] for i in uncaptioned))
+    if not captions:
+        return [], {}, {}
+
+    listing = "\n".join(f"[{i}] ({facets.get(i, 'place')}) {captions[i]}" for i in sorted(captions))
+    out = ctx.llm.generate(system=load_prompt("group_references"),
+                           parts=[Text(context_md), Text("Captioned images:\n" + listing)],
+                           schema=CurateOut)
 
     directions: list[tuple[str, str, list[int]]] = []
     placed: set[int] = set()
@@ -260,18 +306,20 @@ def _write(ctx: RefCtx, project_id: str, scope_id: str, version: str, vocab: Voc
     directions, captions, facets = curated
     notes: list[Note] = [_vocabulary_note(scope_id, version, vocab, verified)]
     for name, why, members in directions:
-        label = f"{name} — {why}" if why else name   # the rationale belongs to the group, not each caption
         for i in members:
-            # facet first, so a reader can tell "could stand in for Devgram" from
-            # "right stonework, wrong country" without opening the image
-            group = f"{FACET_LABELS.get(facets.get(i, 'place'), 'Place')} · {label}"
+            # the facet is the heading, because "could stand in for Devgram" and "right
+            # stonework, wrong country" are what a reader needs to tell apart first. The
+            # direction names the look and rides with the caption, so one direction spanning
+            # several facets stays one idea instead of becoming a repeated heading.
+            group = FACET_LABELS.get(facets.get(i, "place"), "Place")
+            body = f"{name} — {captions[i]}" if name != UNSORTED else captions[i]
             src = _store_image(ctx, project_id, hits[i])
             if src is None:
                 report.warn(f"image {i} could not be stored; skipped")
                 continue
             notes.append(Note(
-                kind="reference_image", body=captions[i][:2000], owner_id=scope_id,
-                author="agent", group=group[:300],
+                kind="reference_image", body=body[:2000], owner_id=scope_id,
+                author="agent", group=group,
                 provenance=[Provenance(source_id=src.id, url=hits[i].page_url or None,
                                        title=hits[i].title or None)],
                 origin=NoteOrigin(producer=PRODUCER, scope=scope_id, digest_version=version),

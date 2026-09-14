@@ -39,7 +39,7 @@ class OutputTruncated(RuntimeError):
 class LLM(Protocol):
     model_id: str   # part of the digest version
 
-    def generate(self, *, system: str, parts: list[Part], schema: type[T], fast: bool = False) -> T: ...
+    def generate(self, *, system: str, parts: list[Part], schema: type[T], fast: bool = False,thinking_level: str | None = None) -> T: ...
 
 
 @dataclass(frozen=True)

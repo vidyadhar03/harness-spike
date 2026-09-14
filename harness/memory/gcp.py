@@ -175,7 +175,11 @@ class GeminiLLM:
         self._client = genai.Client(vertexai=True, project=settings.gcp_project, location=settings.gcp_location)
         self.model_id = f"{settings.model}+{settings.model_fast}"
 
-    def generate(self, *, system: str, parts: list[Part], schema: type[T], fast: bool = False) -> T:
+    def generate(self, *, system: str, parts: list[Part], schema: type[T], fast: bool = False,
+                 thinking_level: str | None = None) -> T:
+        """thinking_level caps reasoning for calls that do not need it. Thinking tokens
+        count against max_output_tokens, so a long mechanical task (captioning two dozen
+        images) can exhaust the budget on reasoning and truncate before writing an answer."""
         from google.genai import errors, types
 
         model = self._s.model_fast if fast else self._s.model
@@ -185,6 +189,8 @@ class GeminiLLM:
             response_json_schema=gemini_schema(schema),
             temperature=self._s.temperature,
             max_output_tokens=self._s.max_output_tokens,
+            thinking_config=(types.ThinkingConfig(thinking_level=thinking_level)
+                             if thinking_level else None),
         )
         contents = [_to_part(p, types) for p in parts]
         for attempt in range(self._s.max_retries + 1):

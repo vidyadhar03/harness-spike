@@ -290,8 +290,8 @@ def render_context_md(pack: ContextPack) -> str:
         facet_order = ["Place", "Terrain", "Architecture", "Material"]
 
         def facet_rank(label: str | None):
-            head = (label or "").split(" · ")[0]
-            return (label is None, facet_order.index(head) if head in facet_order else len(facet_order),
+            return (label is None,
+                    facet_order.index(label) if label in facet_order else len(facet_order),
                     label or "")
 
         for group, items in sorted(groups.items(), key=lambda kv: facet_rank(kv[0])):
