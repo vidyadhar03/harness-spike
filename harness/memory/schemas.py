@@ -97,6 +97,7 @@ class OutTerm(Out):
     term: str
     kind: Literal["technique", "material", "landform", "vegetation", "settlement",
                   "craft", "period", "region", "other"] = "other"
+    needs_region: bool = False          # generic worldwide; search it inside the region terms
     why: str = ""
 
 

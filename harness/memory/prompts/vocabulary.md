@@ -8,6 +8,7 @@ You are given the memory context for one location in a film production. The dire
   - Include a few broader terms that would work even if the specific one is wrong, and a few terms for the landscape and vegetation as well as the buildings.
   - Only propose a term if you are reasonably confident it is a real, documented name. Each term is checked against an encyclopedia and dropped if it does not exist, so a wrong guess costs nothing but an invented term you insist on wastes a slot.
   - kind: technique, material, landform, vegetation, settlement, craft, period, region, or other.
+  - needs_region: true when the term is generic worldwide — a landform, material, or technique found in many countries — so an archive search for it alone returns the world's most photographed example rather than this region's. "river gorge", "slate roofing", "terraced orchard", and "dry stone masonry" need a region. False when the term is already specific: "Kath-kuni", "Kinnaur", "Chamba", and "Himachali vernacular" do not. Terms that need a region are searched inside the terms you mark kind region, so use kind region only for a named geographic area.
   - why: one short line on what this term is expected to show, and which part of the context it comes from.
 - Do not name specific villages, towns, or landmarks as terms unless the context names them. Terms describe a type of place, not a particular address.
 - Write terms in English unless the standard name is a transliteration, which is common for regional techniques and crafts.

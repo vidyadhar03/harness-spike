@@ -8,6 +8,8 @@
   harness-memory context <project_id> "Devgram well" [--confirmed-only] [-o CONTEXT.md]
   harness-memory export <project_id> ./context_export [--confirmed-only]
   harness-memory references <project_id> "Devgram well" [--terms-only | --dry-run]
+  harness-memory caption-eval capture <project_id> "Devgram" -o evals/devgram_candidates.json [--include "File title"]
+  harness-memory caption-eval run evals/devgram_candidates.json [-n 3] [--no-reasons] [-o REPORT.md]
   harness-memory merge <project_id> "Approach Road" "Village Road" [--dry-run]
   harness-memory confirm <project_id> <note_id> [--by NAME]
   harness-memory reject <project_id> <note_id> --reason wrong_scope [--duplicate-of NOTE_ID]
@@ -96,8 +98,47 @@ def print_references(r: ReferenceReport) -> None:
         print("  facets:  " + ", ".join(f"{v} {k}" for k, v in sorted(r.facets.items())))
     for name, count in r.directions:
         print(f"  · {name} ({count} images)")
+    for title, origin in r.kept:
+        # whether region scoping earns its keep: which searches the surviving images came from
+        print(f"    kept: {title[:70]}  <- {origin}")
     for w in r.warnings[:10]:
         print(f"    warn: {w}")
+
+
+def caption_eval_cmd(args, settings: Settings) -> int:
+    from . import caption_eval as ce
+
+    if args.action == "capture":
+        ref_ctx = build_ref_ctx(settings)
+        if ref_ctx.store.get_project(args.project_id) is None:
+            print(f"project {args.project_id} not found", file=sys.stderr)
+            return 1
+        try:
+            fx = ce.capture(ref_ctx, args.project_id, args.scope, include=args.include,
+                            per_term=args.per_term, max_images=args.max_images)
+        except (LookupError, ValueError) as exc:
+            print(exc, file=sys.stderr)
+            return 1
+        ce.save_fixture(args.out, fx)
+        print(f"wrote {args.out}: {len(fx.hits)} candidates for {fx.location}"
+              + (f", {len(fx.included)} included by hand" if fx.included else ""))
+        return 0
+
+    from .gcp import GeminiLLM
+    from .wikimedia import WikimediaImages
+
+    fx = ce.load_fixture(args.fixture)
+    report, warnings = ce.run_eval(GeminiLLM(settings), ce.CachedImages(WikimediaImages(), args.cache), fx,
+                                   n=args.n, reasons=not args.no_reasons)
+    text = (f"fixture: {args.fixture} ({len(fx.hits)} candidates, captured {fx.captured_at})\n"
+            f"caption prompt: {ce.prompt_fingerprint()}  model: {settings.model}  "
+            f"temperature: {settings.temperature if settings.temperature is not None else 'model default'}\n\n"
+            + ce.render(report)
+            + "".join(f"\nwarn: {w}" for w in warnings))
+    print(text)
+    if args.out:
+        Path(args.out).write_text(text + "\n", encoding="utf-8")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -132,6 +173,20 @@ def main(argv: list[str] | None = None) -> int:
     rf.add_argument("--dry-run", action="store_true", help="run the passes, write nothing")
     rf.add_argument("--terms-only", action="store_true",
                     help="stop after vocabulary verification; no image search or fetch")
+    ce = sub.add_parser("caption-eval").add_subparsers(dest="action", required=True)
+    cec = ce.add_parser("capture", help="freeze one run's candidate images and context pack as a fixture")
+    cec.add_argument("project_id")
+    cec.add_argument("scope", help="location id, name, or alias")
+    cec.add_argument("-o", "--out", required=True)
+    cec.add_argument("--include", action="append", default=[], help="Commons file title to append; repeatable")
+    cec.add_argument("--per-term", type=int, default=6)
+    cec.add_argument("--max-images", type=int, default=32)
+    cer = ce.add_parser("run", help="run only the caption pass over a fixture, N times")
+    cer.add_argument("fixture")
+    cer.add_argument("-n", type=int, default=3, help="production runs; the flip count across them is the noise floor")
+    cer.add_argument("--no-reasons", action="store_true", help="skip the separate diagnostic run")
+    cer.add_argument("--cache", default=".cache/caption-eval", help="local image cache")
+    cer.add_argument("-o", "--out", help="also write the report here")
     mg = sub.add_parser("merge")
     mg.add_argument("project_id")
     mg.add_argument("source", help="the duplicate to fold away (id, name, or alias)")
@@ -165,6 +220,8 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     settings = Settings.from_env()
+    if args.cmd == "caption-eval":
+        return caption_eval_cmd(args, settings)
     store_only = args.cmd in ("status", "index", "context", "export", "merge",
                               "confirm", "reject", "set-parent", "confirm-parent")
     if args.cmd == "references":

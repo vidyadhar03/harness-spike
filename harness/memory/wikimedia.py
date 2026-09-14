@@ -23,6 +23,14 @@ _TAGS = re.compile(r"<[^>]+>")
 _LICENSE_OK = re.compile(r"^(cc|public domain|pd|cc0)", re.I)
 
 
+def _norm(name: str) -> str:
+    return " ".join(name.replace("_", " ").lower().split())
+
+
+def _batch(limit: int) -> int:
+    return max(1, min(limit * 2, 50))   # headroom for files the licence and type filters drop
+
+
 def _clean(html: str | None) -> str:
     return " ".join(_TAGS.sub(" ", html or "").replace("&nbsp;", " ").split())
 
@@ -32,6 +40,7 @@ class WikimediaImages:
                  preview_px: int = 1280, thumb_px: int = 512):
         self.timeout, self.user_agent = timeout, user_agent
         self.preview_px, self.thumb_px = preview_px, thumb_px
+        self._categories: dict[tuple[str, str], str | None] = {}
 
     # --- http ---
 
@@ -71,16 +80,79 @@ class WikimediaImages:
 
     # --- images ---
 
-    def search_images(self, term: str, limit: int) -> list[ImageHit]:
+    def search_images(self, term: str, limit: int, region: str | None = None,
+                      region_title: str | None = None) -> list[ImageHit]:
+        """Free-text search, or scoped to a region.
+
+        Commons categories are curated by place, so a region resolves to its category
+        where one exists and the search runs across that category tree: the region's own
+        images with no other words, a term within it otherwise. deepcat keeps the
+        category's precision but ranks by relevance; listing members alphabetises. Free
+        text naming the region is the fallback, because a category that doesn't exist or
+        is too large for deepcat must not make the term unsearchable.
+        """
+        if region is None:
+            return self._search(term, limit)
+        own = _norm(term) == _norm(region)
+        category = self._category(region, region_title)
+        if category:
+            scope = f'deepcat:"{category.removeprefix("Category:")}"'
+            query = scope if own else f"{term} {scope}"
+            hits = self._search(query, limit)
+            log.info("%r: %r returned %d licensed image(s)", term, query, len(hits))
+            if hits:
+                return hits
+        query = term if own else f"{term} {region}"
+        hits = self._search(query, limit)
+        log.info("%r: free text %r returned %d licensed image(s)", term, query, len(hits))
+        return hits
+
+    def get_file(self, title: str) -> ImageHit | None:
+        """One Commons file by title, through the same licence and type filters as search."""
+        hits = self._images(1, titles="File:" + re.sub(r"^File:", "", title))
+        return hits[0] if hits else None
+
+    def _category(self, region: str, title: str | None) -> str | None:
+        """The Commons category for a region, matched against the verified page title first.
+
+        Search ranking alone is not enough: "Kinnaur" ranks Category:Kinnaur Kailash, a
+        mountain, above Category:Kinnaur district. Only an exact name match is accepted.
+        """
+        key = (_norm(region), _norm(title or ""))
+        if key in self._categories:
+            return self._categories[key]
+        wanted = [n for n in dict.fromkeys([_norm(title or ""), _norm(region)]) if n]
+        found = None
+        for query in wanted:
+            try:
+                data = self._api(COMMONS_API, action="query", list="search", srsearch=query,
+                                 srnamespace=14, srlimit=20)
+            except Exception as exc:
+                log.warning("category search failed for %r: %s", query, exc)
+                continue
+            titles = {_norm(r["title"].removeprefix("Category:")): r["title"]
+                      for r in data.get("query", {}).get("search", [])}
+            found = next((titles[n] for n in wanted if n in titles), None)
+            if found:
+                break
+        log.info("region %r (%s) resolved to %s", region, title or "no page", found or "no category")
+        self._categories[key] = found
+        return found
+
+    def _search(self, query: str, limit: int) -> list[ImageHit]:
+        return self._images(limit, generator="search", gsrsearch=f"{query} -icon -logo -map",
+                            gsrnamespace=6, gsrlimit=_batch(limit))
+
+    def _images(self, limit: int, **generator) -> list[ImageHit]:
         try:
             data = self._api(
-                COMMONS_API, action="query", generator="search", gsrsearch=f"{term} -icon -logo -map",
-                gsrnamespace=6, gsrlimit=max(1, min(limit * 2, 50)), prop="imageinfo",
+                COMMONS_API, action="query", prop="imageinfo",
                 iiprop="url|extmetadata|size|mime", iiurlwidth=self.preview_px,
                 iiextmetadatafilter="ImageDescription|LicenseShortName|Artist|Credit|License",
+                **generator,
             )
         except Exception as exc:
-            log.warning("image search failed for %r: %s", term, exc)
+            log.warning("image search failed for %r: %s", generator, exc)
             return []
         hits: list[ImageHit] = []
         for page in data.get("query", {}).get("pages", []):

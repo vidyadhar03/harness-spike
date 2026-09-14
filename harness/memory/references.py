@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from collections import Counter
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -53,6 +54,8 @@ class ReferenceReport:
     images_found: int = 0
     images_kept: int = 0
     images_uncaptioned: int = 0
+    kept: list[tuple[str, str]] = field(default_factory=list)       # (title, term and query that found it)
+    origins: dict[str, str] = field(default_factory=dict)           # image key -> term and query
     directions: list[tuple[str, int]] = field(default_factory=list)
     facets: Counter = field(default_factory=Counter)
     notes_written: int = 0
@@ -94,7 +97,7 @@ def suggest_references(ctx: RefCtx, project_id: str, scope_ref: str, *, per_term
     if terms_only:
         return report      # tuning the vocabulary costs one model call, not dozens of fetches
 
-    hits = _retrieve(ctx, verified, per_term, max_images, report)
+    hits = _retrieve(ctx, vocab, verified, per_term, max_images, report)
     if not hits:
         report.warn("no licensed images found for the verified terms")
     curated = _curate(ctx, context_md, hits, report) if hits else ([], {}, {})
@@ -135,33 +138,109 @@ def _verify(ctx: RefCtx, vocab: VocabularyOut, report: ReferenceReport) -> list[
     return verified
 
 
-def _retrieve(ctx: RefCtx, verified: list[tuple[str, TermHit]], per_term: int, max_images: int,
-              report: ReferenceReport) -> list[ImageHit]:
-    """Round-robin across terms so one prolific term cannot crowd out the rest."""
+def _retrieve(ctx: RefCtx, vocab: VocabularyOut, verified: list[tuple[str, TermHit]], per_term: int,
+              max_images: int, report: ReferenceReport) -> list[ImageHit]:
+    """Round-robin across terms so one prolific term cannot crowd out the rest.
+
+    A generic term on its own returns the world's most photographed example ("river gorge"
+    is the New River Gorge), so a term needing a region is searched inside every region term
+    first, and the bare term is only a fallback when no region has anything.
+    """
+    by_term = {t.term: t for t in vocab.terms}
+    regions = [(term, hit) for term, hit in verified if by_term[term].kind == "region"]
     per_term_hits = []
-    for term, _ in verified:
-        found = ctx.images.search_images(term, per_term)
-        log.info("%s: %r returned %d licensed image(s)", report.location, term, len(found))
+    for term, hit in verified:
+        spec = by_term[term]
+        if spec.kind == "region":
+            found = ctx.images.search_images(term, per_term, region=term, region_title=hit.title)
+            via = "its own region"
+        elif spec.needs_region and regions:
+            scoped, via_regions = [], []
+            for region, region_hit in regions:
+                r_found = ctx.images.search_images(term, per_term, region=region, region_title=region_hit.title)
+                if r_found:
+                    scoped.append(r_found)
+                    via_regions.append(f"{region} ({len(r_found)})")
+            if scoped:
+                found = _dedupe(_interleave(scoped))[:per_term]
+                via = "in " + ", ".join(via_regions)
+            else:
+                found = ctx.images.search_images(term, per_term)
+                via = "unscoped, no region had results"
+        else:
+            found = ctx.images.search_images(term, per_term)
+            via = "unscoped"
+        log.info("%s: %r returned %d licensed image(s) %s", report.location, term, len(found), via)
         if not found:
             report.warn(f"{term!r} returned no licensed images")
         report.images_found += len(found)
         per_term_hits.append(found)
+        for h in found:
+            report.origins.setdefault(h.image_url or h.page_url, f"{term} ({via})")
 
     seen: set[str] = set()
     out: list[ImageHit] = []
-    for rank in range(per_term):
-        for found in per_term_hits:
-            if rank >= len(found):
-                continue
-            hit = found[rank]
-            key = hit.image_url or hit.page_url
-            if not key or key in seen or not hit.preview_url:
-                continue
+    for hit in _interleave(per_term_hits):
+        key = hit.image_url or hit.page_url
+        if not key or key in seen or not hit.preview_url:
+            continue
+        seen.add(key)
+        out.append(hit)
+        if len(out) >= max_images:
+            return out
+    return out
+
+
+def _interleave(lists: list[list[ImageHit]]) -> Iterator[ImageHit]:
+    for rank in range(max((len(found) for found in lists), default=0)):
+        for found in lists:
+            if rank < len(found):
+                yield found[rank]
+
+
+def _dedupe(hits: Iterable[ImageHit]) -> list[ImageHit]:
+    seen: set[str] = set()
+    out = []
+    for hit in hits:
+        key = hit.image_url or hit.page_url
+        if key not in seen:
             seen.add(key)
             out.append(hit)
-            if len(out) >= max_images:
-                return out
     return out
+
+
+def caption_parts(images: Images, context_md: str, hits: list[ImageHit], indices: list[int],
+                  report: ReferenceReport) -> tuple[list, list[int]]:
+    """One caption call's input, and the indices whose images could be fetched.
+
+    Shared with the caption eval, because which images share a call is part of what it measures.
+    """
+    parts: list = [Text(context_md), Text(f"{len(indices)} candidate images follow.")]
+    present: list[int] = []
+    for i in indices:
+        hit = hits[i]
+        try:
+            data = images.fetch(hit.preview_url)
+        except Exception as exc:
+            report.warn(f"could not fetch image {i} ({hit.title}): {exc}")
+            continue
+        present.append(i)
+        parts.append(Text(f"[{i}] {hit.title}" + (f" — {hit.description}" if hit.description else "")))
+        parts.append(Blob(data, hit.mime_type))
+    return parts, present
+
+
+def caption_all(ctx: RefCtx, context_md: str, hits: list[ImageHit], report: ReferenceReport
+                ) -> tuple[dict[int, str], dict[int, str]]:
+    """Caption every candidate in bounded batches, in retrieval order."""
+    captions: dict[int, str] = {}
+    facets: dict[int, str] = {}
+    order = list(range(len(hits)))
+    for start in range(0, len(order), CAPTION_BATCH):
+        batch_c, batch_f = _caption(ctx, context_md, hits, order[start:start + CAPTION_BATCH], report)
+        captions.update(batch_c)
+        facets.update(batch_f)
+    return captions, facets
 
 
 def _caption(ctx: RefCtx, context_md: str, hits: list[ImageHit], indices: list[int],
@@ -172,18 +251,7 @@ def _caption(ctx: RefCtx, context_md: str, hits: list[ImageHit], indices: list[i
     answer is written. Halving is always safe: captioning one image never depends on
     seeing the others.
     """
-    parts: list = [Text(context_md), Text(f"{len(indices)} candidate images follow.")]
-    present: list[int] = []
-    for i in indices:
-        hit = hits[i]
-        try:
-            data = ctx.images.fetch(hit.preview_url)
-        except Exception as exc:
-            report.warn(f"could not fetch image {i} ({hit.title}): {exc}")
-            continue
-        present.append(i)
-        parts.append(Text(f"[{i}] {hit.title}" + (f" — {hit.description}" if hit.description else "")))
-        parts.append(Blob(data, hit.mime_type))
+    parts, present = caption_parts(ctx.images, context_md, hits, indices, report)
     if not present:
         return {}, {}
 
@@ -216,13 +284,8 @@ def _curate(ctx: RefCtx, context_md: str, hits: list[ImageHit], report: Referenc
     small judgement over text. Keeping them apart stops the whole pass from growing with
     the number of images retrieved.
     """
-    captions: dict[int, str] = {}
-    facets: dict[int, str] = {}
+    captions, facets = caption_all(ctx, context_md, hits, report)
     order = list(range(len(hits)))
-    for start in range(0, len(order), CAPTION_BATCH):
-        batch_c, batch_f = _caption(ctx, context_md, hits, order[start:start + CAPTION_BATCH], report)
-        captions.update(batch_c)
-        facets.update(batch_f)
 
     uncaptioned = [i for i in order if i not in captions]
     if uncaptioned:
@@ -257,6 +320,8 @@ def _curate(ctx: RefCtx, context_md: str, hits: list[ImageHit], report: Referenc
         placed |= set(unplaced)
 
     report.images_kept = len(placed)
+    report.kept = [(hits[i].title, report.origins.get(hits[i].image_url or hits[i].page_url, ""))
+                   for _, _, members in directions for i in members]
     report.images_uncaptioned = len(uncaptioned)
     report.directions = [(name, len(members)) for name, _, members in directions]
     report.facets = Counter(facets[i] for i in placed if i in facets)

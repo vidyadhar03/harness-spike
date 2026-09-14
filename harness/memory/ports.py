@@ -68,7 +68,12 @@ class Images(Protocol):
     """An image archive: term lookup plus image search. Wikimedia by default."""
 
     def verify_term(self, term: str) -> TermHit | None: ...
-    def search_images(self, term: str, limit: int) -> list[ImageHit]: ...
+    def search_images(self, term: str, limit: int, region: str | None = None,
+                      region_title: str | None = None) -> list[ImageHit]:
+        """Licensed images for a term. With a region, only images from that region;
+        region_title is the page the region term verified against. A term scoped to
+        itself (term == region) means the region's own images."""
+        ...
     def fetch(self, url: str) -> bytes: ...
 
 
@@ -96,16 +101,22 @@ class Store(Protocol):
 
 
 class MemoryImages:
-    def __init__(self, terms: dict[str, TermHit], images: dict[str, list[ImageHit]], blobs: dict[str, bytes]):
+    def __init__(self, terms: dict[str, TermHit], images: dict[str, list[ImageHit]], blobs: dict[str, bytes],
+                 scoped: dict[tuple[str, str], list[ImageHit]] | None = None):
         self.terms, self.images, self.blobs = terms, images, blobs
+        self.scoped = scoped or {}      # (term, region) -> hits
         self.searched: list[str] = []
+        self.queries: list[tuple[str, str | None]] = []
 
     def verify_term(self, term):
         return self.terms.get(term.lower())
 
-    def search_images(self, term, limit):
+    def search_images(self, term, limit, region=None, region_title=None):
         self.searched.append(term)
-        return self.images.get(term.lower(), [])[:limit]
+        self.queries.append((term, region))
+        if region is None:
+            return self.images.get(term.lower(), [])[:limit]
+        return self.scoped.get((term.lower(), region.lower()), [])[:limit]
 
     def fetch(self, url):
         if url not in self.blobs:
