@@ -68,8 +68,8 @@ def default_handler(schema, system, parts):
         return CurateOut(
             directions=[OutDirection(name="Weathered slate and dark timber", why="Older, heavier.", images=a),
                         OutDirection(name="Open terraced slopes", why="Wider, greener.", images=b),
-                        OutDirection(name="Too thin", images=indices[4:5])],
-            captions=[OutCaption(index=i, caption=f"Caption {i}.") for i in indices],
+                        OutDirection(name="Named but empty", images=[])],
+            captions=[OutCaption(index=i, caption=f"Caption {i}.") for i in indices[:5]],
         )
     raise AssertionError(schema)
 
@@ -92,17 +92,20 @@ def test_images_are_grouped_stored_and_written_back(world):
     ctx = make_ctx(store, images, default_handler)
     report = suggest_references(ctx, PID, well.id, per_term=2, max_images=6)
 
-    assert report.images_found == 10 and report.images_kept == 4
-    assert report.directions == [("Weathered slate and dark timber", 2), ("Open terraced slopes", 2)]
-    assert any("not placed in a direction" in w for w in report.warnings)
-    assert any("fewer than 2 usable images" in w for w in report.warnings)
+    assert report.images_found == 10 and report.images_kept == 5   # nothing captioned is lost
+    assert report.directions == [("Weathered slate and dark timber", 2),
+                                 ("Open terraced slopes", 2), ("Unsorted", 1)]
+    assert report.images_uncaptioned == 1
+    assert any("named no usable images" in w for w in report.warnings)
+    assert any("kept under 'Unsorted'" in w for w in report.warnings)
+    assert any("judged irrelevant" in w for w in report.warnings)
 
     notes = store.list_notes(PID)
     refs = [n for n in notes if n.kind == "reference_image"]
     vocab = [n for n in notes if n.kind == "vocabulary"]
-    assert len(refs) == 4 and len(vocab) == 1
+    assert len(refs) == 5 and len(vocab) == 1
     assert {n.group for n in refs} == {"Weathered slate and dark timber — Older, heavier.",
-                                       "Open terraced slopes — Wider, greener."}
+                                       "Open terraced slopes — Wider, greener.", "Unsorted"}
     assert all(n.status == "proposed" and n.owner_id == well.id for n in refs)
     assert all(n.origin.producer == "references" and n.origin.scope == well.id for n in refs + vocab)
     assert refs[0].body.startswith("Caption ")           # the rationale lives on the group, not every caption
@@ -111,7 +114,7 @@ def test_images_are_grouped_stored_and_written_back(world):
     assert "made up term" not in vocab[0].body and "stone well" in vocab[0].body
 
     stored = {s.id: s for s in store.list_sources(PID)}
-    assert len(stored) == 4
+    assert len(stored) == 5
     src = stored[refs[0].provenance[0].source_id]
     assert src.kind == "image" and src.doc_type == "reference" and src.license == "CC BY-SA 4.0"
     assert src.attribution == "A. Photographer" and src.origin_url.startswith("https://commons.wikimedia.org/")
@@ -136,15 +139,18 @@ def test_rerun_replaces_proposals_but_keeps_reviewed_images(world):
 
     refs = [n for n in store.list_notes(PID) if n.kind == "reference_image"]
     keep, drop = refs[0], refs[1]
-    store.put_notes(PID, [keep.model_copy(update={"status": "confirmed"}),
-                          drop.model_copy(update={"status": "rejected"})])
+    store.put_notes(PID, [
+        keep.model_copy(update={"status": "confirmed", "reviewed_revision": keep.revision,
+                                "reviewed_by": "vd"}),
+        drop.model_copy(update={"status": "rejected", "reviewed_revision": drop.revision,
+                                "reviewed_by": "vd", "review_reason": "not_useful"})])
 
     report = suggest_references(ctx, PID, well.id, per_term=2, max_images=6)
     after = [n for n in store.list_notes(PID) if n.kind == "reference_image"]
-    assert report.notes_replaced == 3                      # two proposed images plus the vocabulary note
+    assert report.notes_replaced == 4                      # three proposed images plus the vocabulary note
     assert {n.status for n in after} == {"confirmed", "rejected", "proposed"}
-    assert len(after) == 4                                 # the rejected image is not proposed again
-    assert sum(n.status == "proposed" for n in after) == 2
+    assert len(after) == 5                                 # the rejected image is not proposed again
+    assert sum(n.status == "proposed" for n in after) == 3
 
 
 def test_context_md_shows_directions_with_licence(world):
@@ -172,4 +178,4 @@ def test_unfetchable_image_is_skipped_not_fatal(world):
     ctx = make_ctx(store, images, default_handler)
     report = suggest_references(ctx, PID, well.id, per_term=2, max_images=6)
     assert any("could not fetch image" in w for w in report.warnings)
-    assert report.images_kept == 4 and report.notes_written == 5
+    assert report.images_kept == 5 and report.notes_written == 6   # one fetch failed, rest survive

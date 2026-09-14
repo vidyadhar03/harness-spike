@@ -7,7 +7,7 @@
   harness-memory index <project_id>
   harness-memory context <project_id> "Devgram well" [--confirmed-only] [-o CONTEXT.md]
   harness-memory export <project_id> ./context_export [--confirmed-only]
-  harness-memory references <project_id> "Devgram well" [--dry-run]
+  harness-memory references <project_id> "Devgram well" [--terms-only | --dry-run]
   harness-memory merge <project_id> "Approach Road" "Village Road" [--dry-run]
   harness-memory confirm <project_id> <note_id> [--by NAME]
   harness-memory reject <project_id> <note_id> --reason wrong_scope [--duplicate-of NOTE_ID]
@@ -81,13 +81,19 @@ def print_report(r: IngestReport) -> None:
 
 
 def print_references(r: ReferenceReport) -> None:
-    print(f"{r.location}: {len(r.terms_verified)}/{r.terms_proposed} terms verified, "
-          f"{r.images_kept}/{r.images_found} images kept, {r.notes_written} notes "
-          f"({r.notes_replaced} replaced)")
+    line = f"{r.location}: {len(r.terms_verified)}/{r.terms_proposed} terms verified"
+    if r.images_found or r.images_kept:
+        line += (f", {r.images_kept}/{r.images_found} images kept"
+                 + (f" ({r.images_uncaptioned} judged irrelevant)" if r.images_uncaptioned else ""))
+    line += f", {r.notes_written} notes ({r.notes_replaced} replaced)"
+    print(line)
     if r.terms_verified:
         print("  terms:   " + ", ".join(r.terms_verified))
     if r.terms_dropped:
         print("  dropped: " + ", ".join(r.terms_dropped))
+    if r.facets:
+        # how many images could stand in for the place, vs only share its terrain or stonework
+        print("  facets:  " + ", ".join(f"{v} {k}" for k, v in sorted(r.facets.items())))
     for name, count in r.directions:
         print(f"  · {name} ({count} images)")
     for w in r.warnings[:10]:
@@ -124,6 +130,8 @@ def main(argv: list[str] | None = None) -> int:
     rf.add_argument("--per-term", type=int, default=6)
     rf.add_argument("--max-images", type=int, default=32)
     rf.add_argument("--dry-run", action="store_true", help="run the passes, write nothing")
+    rf.add_argument("--terms-only", action="store_true",
+                    help="stop after vocabulary verification; no image search or fetch")
     mg = sub.add_parser("merge")
     mg.add_argument("project_id")
     mg.add_argument("source", help="the duplicate to fold away (id, name, or alias)")
@@ -198,7 +206,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "references":
         try:
             report = suggest_references(ref_ctx, args.project_id, args.scope, per_term=args.per_term,
-                                        max_images=args.max_images, dry_run=args.dry_run)
+                                        max_images=args.max_images,
+                                        dry_run=args.dry_run or args.terms_only,
+                                        terms_only=args.terms_only)
         except (LookupError, ValueError) as exc:
             print(exc, file=sys.stderr)
             return 1

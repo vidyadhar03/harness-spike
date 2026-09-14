@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -26,6 +27,9 @@ from .schemas import CurateOut, VocabularyOut
 log = logging.getLogger(__name__)
 
 PRODUCER = "references"
+UNSORTED = "Unsorted"
+FACET_LABELS = {"place": "Place", "terrain": "Terrain",
+                "architecture": "Architecture", "material": "Material"}
 REFERENCES_VERSION = "references-v1"
 
 
@@ -47,7 +51,9 @@ class ReferenceReport:
     terms_dropped: list[str] = field(default_factory=list)
     images_found: int = 0
     images_kept: int = 0
+    images_uncaptioned: int = 0
     directions: list[tuple[str, int]] = field(default_factory=list)
+    facets: Counter = field(default_factory=Counter)
     notes_written: int = 0
     notes_replaced: int = 0
     warnings: list[str] = field(default_factory=list)
@@ -66,7 +72,8 @@ def references_version(llm: LLM) -> str:
 
 
 def suggest_references(ctx: RefCtx, project_id: str, scope_ref: str, *, per_term: int = 6,
-                       max_images: int = 32, dry_run: bool = False) -> ReferenceReport:
+                       max_images: int = 32, dry_run: bool = False,
+                       terms_only: bool = False) -> ReferenceReport:
     scope_id = resolve_scope(ctx.store, project_id, scope_ref)
     entity = ctx.store.get_entity(project_id, scope_id)
     if not isinstance(entity, Location):
@@ -83,10 +90,13 @@ def suggest_references(ctx: RefCtx, project_id: str, scope_ref: str, *, per_term
         report.warn("no search terms survived verification; nothing to retrieve")
         return report
 
+    if terms_only:
+        return report      # tuning the vocabulary costs one model call, not dozens of fetches
+
     hits = _retrieve(ctx, verified, per_term, max_images, report)
     if not hits:
         report.warn("no licensed images found for the verified terms")
-    curated = _curate(ctx, context_md, hits, report) if hits else ([], {})
+    curated = _curate(ctx, context_md, hits, report) if hits else ([], {}, {})
 
     if dry_run:
         return report
@@ -114,6 +124,7 @@ def _verify(ctx: RefCtx, vocab: VocabularyOut, report: ReferenceReport) -> list[
     returns plausible-looking rubbish, so it is dropped rather than downweighted."""
     verified: list[tuple[str, TermHit]] = []
     for t in vocab.terms:
+        log.info("verifying term %r", t.term)
         hit = ctx.images.verify_term(t.term)
         if hit is None:
             report.terms_dropped.append(t.term)
@@ -129,6 +140,9 @@ def _retrieve(ctx: RefCtx, verified: list[tuple[str, TermHit]], per_term: int, m
     per_term_hits = []
     for term, _ in verified:
         found = ctx.images.search_images(term, per_term)
+        log.info("%s: %r returned %d licensed image(s)", report.location, term, len(found))
+        if not found:
+            report.warn(f"{term!r} returned no licensed images")
         report.images_found += len(found)
         per_term_hits.append(found)
 
@@ -149,8 +163,8 @@ def _retrieve(ctx: RefCtx, verified: list[tuple[str, TermHit]], per_term: int, m
     return out
 
 
-def _curate(ctx: RefCtx, context_md: str, hits: list[ImageHit],
-            report: ReferenceReport) -> tuple[list[tuple[str, str, list[int]]], dict[int, str]]:
+def _curate(ctx: RefCtx, context_md: str, hits: list[ImageHit], report: ReferenceReport
+            ) -> tuple[list[tuple[str, str, list[int]]], dict[int, str], dict[int, str]]:
     parts = [Text(context_md), Text(f"{len(hits)} candidate images follow.")]
     usable: list[int] = []
     for i, hit in enumerate(hits):
@@ -163,26 +177,44 @@ def _curate(ctx: RefCtx, context_md: str, hits: list[ImageHit],
         parts.append(Text(f"[{i}] {hit.title}" + (f" — {hit.description}" if hit.description else "")))
         parts.append(Blob(data, hit.mime_type))
     if not usable:
-        return [], {}
+        return [], {}, {}
 
     out = ctx.llm.generate(system=load_prompt("curate_references"), parts=parts, schema=CurateOut)
     captions = {c.index: c.caption.strip() for c in out.captions if c.index in set(usable) and c.caption.strip()}
+    # what each image is a reference FOR: a place to stand in for the location, or only its
+    # architecture, material or terrain. An image from another country with the right stone
+    # is a good material reference and a bad place reference.
+    facets = {c.index: c.facet for c in out.captions if c.index in captions}
+    uncaptioned = [i for i in usable if i not in captions]
+    if uncaptioned:
+        report.warn(f"{len(uncaptioned)} image(s) judged irrelevant and left uncaptioned: "
+                    + ", ".join(hits[i].title[:40] for i in uncaptioned))
+
     directions: list[tuple[str, str, list[int]]] = []
     placed: set[int] = set()
     for d in out.directions:
         members = [i for i in d.images if i in captions and i not in placed]
-        if len(members) < 2:
-            if members:
-                report.warn(f"direction {d.name!r} had fewer than 2 usable images; dropped")
+        if not members:
+            # a named direction with no usable images is the model changing its mind mid-answer
+            report.warn(f"direction {d.name.strip() or 'unnamed'!r} named no usable images; dropped")
             continue
         placed |= set(members)
         directions.append((d.name.strip() or "Untitled direction", d.why.strip(), members))
-    dropped = len(usable) - len(placed)
-    if dropped:
-        report.warn(f"{dropped} candidate images were not placed in a direction and were dropped")
+
+    # a captioned image the model forgot to file is still a usable reference: keep it rather
+    # than silently discarding work the director may want
+    unplaced = [i for i in captions if i not in placed]
+    if unplaced:
+        report.warn(f"{len(unplaced)} captioned image(s) were not placed in a direction; "
+                    f"kept under {UNSORTED!r}")
+        directions.append((UNSORTED, "", unplaced))
+        placed |= set(unplaced)
+
     report.images_kept = len(placed)
+    report.images_uncaptioned = len(uncaptioned)
     report.directions = [(name, len(members)) for name, _, members in directions]
-    return directions, captions
+    report.facets = Counter(facets[i] for i in placed if i in facets)
+    return directions, captions, facets
 
 
 # --- write-back -----------------------------------------------------------------------
@@ -224,12 +256,15 @@ def _vocabulary_note(scope_id: str, version: str, vocab: VocabularyOut,
 
 def _write(ctx: RefCtx, project_id: str, scope_id: str, version: str, vocab: VocabularyOut,
            verified: list[tuple[str, TermHit]], hits: list[ImageHit],
-           curated: tuple[list[tuple[str, str, list[int]]], dict[int, str]], report: ReferenceReport) -> None:
-    directions, captions = curated
+           curated: tuple[list, dict, dict], report: ReferenceReport) -> None:
+    directions, captions, facets = curated
     notes: list[Note] = [_vocabulary_note(scope_id, version, vocab, verified)]
     for name, why, members in directions:
-        group = f"{name} — {why}" if why else name   # the rationale belongs to the group, not each caption
+        label = f"{name} — {why}" if why else name   # the rationale belongs to the group, not each caption
         for i in members:
+            # facet first, so a reader can tell "could stand in for Devgram" from
+            # "right stonework, wrong country" without opening the image
+            group = f"{FACET_LABELS.get(facets.get(i, 'place'), 'Place')} · {label}"
             src = _store_image(ctx, project_id, hits[i])
             if src is None:
                 report.warn(f"image {i} could not be stored; skipped")

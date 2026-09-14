@@ -115,6 +115,7 @@ class OutDirection(Out):
 class OutCaption(Out):
     index: int
     caption: str
+    facet: Literal["place", "architecture", "material", "terrain"] = "place"
 
 
 class CurateOut(Out):

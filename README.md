@@ -124,12 +124,27 @@ harness-memory context $PID "Tree Temple" -o CONTEXT.md
 harness-memory export $PID ./export_v1
 harness-memory export $PID ./export_v1_confirmed --confirmed-only
 
+# review: decisions are recorded against a specific revision of the assertion
+harness-memory confirm $PID note_xxxx --by vd
+harness-memory reject $PID note_xxxx --reason wrong_scope --by vd
+harness-memory reject $PID note_xxxx --duplicate-of note_yyyy --by vd
+
+# containment: only CONFIRMED parents inherit notes downward
+harness-memory set-parent $PID "Market Square" "Devgram" --by vd
+harness-memory confirm-parent $PID "Market Square" --by vd
+harness-memory confirm-parent $PID "Orchards" --reject --by vd
+
+# a new draft of an existing document
+harness-memory drop $PID ~/dehleez_dump/scripts/Ep1_draft2.pdf \
+  --supersedes <sha256-of-draft-1> --revision "Draft 2"
+
 # merge a duplicate entity into the one you keep (source folds into target)
 harness-memory merge $PID "Approach Road" "Village Road" --dry-run
 harness-memory merge $PID "Approach Road" "Village Road"
 
 # real-world visual references (per location)
-harness-memory references $PID "Tree Temple" --dry-run   # terms only, writes nothing
+harness-memory references $PID "Tree Temple" --terms-only  # vocabulary + verification only, seconds
+harness-memory references $PID "Tree Temple" --dry-run     # full run, writes nothing (slow)
 harness-memory references $PID "Tree Temple"
 harness-memory references $PID "Tree Temple" --per-term 6 --max-images 32
 ```
@@ -150,11 +165,13 @@ Confirmed and rejected notes survive a re-digest; only proposed ones are replace
 
 ## What to watch in the output
 
-- `scene_only_notes: N` — notes with a scene scope and no location. Should be ~0.
+- `unowned_notes: N` — notes the model returned with no owner. Should be ~0.
 - `slugline not found` — the text layer extracted badly; chunking fell back to page numbers.
 - `output truncated; split into N` — split-and-retry fired.
 - `dropped unscoped note` — note had no location, scene, or project-wide scope.
 - Locations with 0 notes, or duplicate locations that need merging (`harness-memory merge`).
+- `inside X (proposed)` in the index — containment waiting for `confirm-parent`.
+- "Some notes come from superseded drafts" in a context pack — reconcile after a new draft.
 
 ## Wiping spike data
 

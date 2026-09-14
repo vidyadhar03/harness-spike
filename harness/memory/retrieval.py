@@ -285,7 +285,16 @@ def render_context_md(pack: ContextPack) -> str:
         groups: dict[str | None, list] = {}
         for r in refs:
             groups.setdefault(r.group, []).append(r)
-        for group, items in sorted(groups.items(), key=lambda kv: (kv[0] is None, kv[0] or "")):
+        # a place that could stand in for the location reads before one that only shares
+        # its stonework, so the director sees the closest matches first
+        facet_order = ["Place", "Terrain", "Architecture", "Material"]
+
+        def facet_rank(label: str | None):
+            head = (label or "").split(" · ")[0]
+            return (label is None, facet_order.index(head) if head in facet_order else len(facet_order),
+                    label or "")
+
+        for group, items in sorted(groups.items(), key=lambda kv: facet_rank(kv[0])):
             if group:
                 lines.append(f"### {group}")
             for r in items:

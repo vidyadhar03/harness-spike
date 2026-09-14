@@ -18,7 +18,7 @@ log = logging.getLogger(__name__)
 
 WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
-USER_AGENT = "MotionX-harness/0.5 (https://motionx.in; tech@motionx.in)"
+USER_AGENT = "MotionX-harness/0.5 (https://motionx.in; contact: tech@motionx.in)"
 _TAGS = re.compile(r"<[^>]+>")
 _LICENSE_OK = re.compile(r"^(cc|public domain|pd|cc0)", re.I)
 
