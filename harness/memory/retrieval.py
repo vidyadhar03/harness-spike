@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .models import (
     PROJECT_SCOPE, ConditionalNotes, ContextPack, InheritedNotes, Location, Note,
-    ReferenceImage, Scene, Source,
+    ReferenceImage, RetrievalOrigin, Scene, Source,
 )
 from .ports import EntityDoc, Store
 from .resolver import natural_key, norm, scene_key
@@ -214,7 +214,9 @@ def _reference(n: Note, sources: dict[str, Source]) -> ReferenceImage | None:
         return None
     return ReferenceImage(note_id=n.id, uri=uri, caption=n.body, status=n.status, source_id=src.id,
                           page=prov.page, group=n.group, origin_url=src.origin_url, license=src.license,
-                          attribution=src.attribution)
+                          attribution=src.attribution, guidance=n.guidance,
+                          direction=n.direction, direction_rationale=n.direction_rationale,
+                          retrieval_origins=prov.retrieval_origins, depicted_place=prov.depicted_place)
 
 
 # --- rendering -------------------------------------------------------------------
@@ -330,6 +332,130 @@ def render_context_md(pack: ContextPack) -> str:
 
     if pack.project_notes:
         lines += ["## Project-wide", *[_bullet(n, src) for n in pack.project_notes], ""]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+# --- references-specific context ------------------------------------------------
+
+def _is_generated_ref(n: Note) -> bool:
+    """True for notes produced by the references pipeline."""
+    return n.origin is not None and n.origin.producer == "references"
+
+
+def _filter_generated_refs(notes: list[Note]) -> list[Note]:
+    """Exclude prior generated vocabulary and unselected (proposed) reference images.
+
+    Confirmed reference images are preserved — they represent director-approved inspiration.
+    """
+    return [
+        n for n in notes
+        if not _is_generated_ref(n)
+        or (n.kind == "reference_image" and n.status == "confirmed")
+    ]
+
+
+def get_references_context(store: Store, project_id: str, scope_ref: str) -> ContextPack:
+    """Build a context pack filtered for the references pipeline.
+
+    Excludes prior generated vocabulary and unselected proposed reference images
+    from all note collections. Confirmed references survive as director-approved
+    inspiration, clearly distinguished in rendering.
+    """
+    pack = get_context(store, project_id, scope_ref)
+    pack.notes = _filter_generated_refs(pack.notes)
+    pack.conditional = [
+        c.model_copy(update={"notes": _filter_generated_refs(c.notes)})
+        for c in pack.conditional
+    ]
+    pack.conditional = [c for c in pack.conditional if c.notes]
+    pack.inherited = [
+        i.model_copy(update={"notes": _filter_generated_refs(i.notes)})
+        for i in pack.inherited
+    ]
+    pack.inherited = [i for i in pack.inherited if i.notes]
+    pack.project_notes = _filter_generated_refs(pack.project_notes)
+    # rebuild reference_images from the now-filtered notes to exclude proposed ref images
+    sources = store.get_sources(project_id, [p.source_id for n in _all_notes(pack) for p in n.provenance if p.source_id])
+    pack.reference_images = [
+        ref for n in pack.notes + [x for c in pack.conditional for x in c.notes]
+        if n.kind == "reference_image" and n.status == "confirmed"
+        and (ref := _reference(n, sources)) is not None
+    ]
+    return pack
+
+
+def render_references_context_md(pack: ContextPack) -> str:
+    """Render context markdown for the references pipeline.
+
+    Identical to render_context_md except confirmed references are rendered
+    under a separate heading with a clear disclaimer, and any guidance
+    annotations are included.
+    """
+    src = pack.sources
+    lines: list[str] = []
+    e = pack.entity
+    if e is None:
+        lines += ["# Project-wide context", ""]
+    else:
+        kind = "Location" if isinstance(e, Location) else f"Scene {e.number}"
+        lines += [f"# {e.name}", f"{kind} · `{e.id}` · {e.status}"]
+        if isinstance(e, Location) and e.aliases:
+            lines.append(f"Also called: {', '.join(e.aliases)}")
+        if pack.ancestors:
+            lines.append("Inside: " + " → ".join(a.name for a in reversed(pack.ancestors)))
+        if pack.merged_ids:
+            lines.append(f"Merged in: {', '.join(f'`{i}`' for i in pack.merged_ids)}")
+        lines.append("")
+    lines.append("Notes marked [proposed] are unreviewed." if pack.include_proposed
+                 else "Confirmed notes only.")
+    if pack.superseded_sources:
+        lines.append(f"Some notes come from superseded drafts: {', '.join(pack.superseded_sources)}. "
+                     "They have not been reconciled against the current version.")
+    lines.append("")
+
+    body = [n for n in pack.notes if n.kind not in ("reference_image", "vocabulary")]
+    lines += _kind_sections(body, src, "##") or ["_No notes yet._", ""]
+
+    refs = [r for r in pack.reference_images if r.status == "confirmed"]
+    if refs:
+        lines += [
+            "## Director-approved reference inspiration",
+            "_These are visual references the director confirmed as useful inspiration. "
+            "They are not script requirements, geography, or geometry._",
+            "",
+        ]
+        for r in refs:
+            where = r.attribution or src.get(r.source_id, r.source_id[:12])
+            if r.license:
+                where += f", {r.license}"
+            caption_line = f"- {' '.join(r.caption.split())} — `{r.uri}` _({where})_"
+            if r.guidance:
+                caption_line += f" **Guidance:** {' '.join(r.guidance.split())}"
+            lines.append(caption_line)
+        lines.append("")
+
+    if pack.conditional:
+        lines += ["## Only during these scenes",
+                  "_True while the scene plays, not the place's usual state._", ""]
+        for group in pack.conditional:
+            text = [n for n in group.notes if n.kind not in ("reference_image", "vocabulary")]
+            if text:
+                lines += [f"### {group.label}", *[_bullet(n, src) for n in text], ""]
+
+    if pack.inherited:
+        lines.append("## Inherited")
+        for group in pack.inherited:
+            inh_notes = [n for n in group.notes if n.kind not in ("reference_image", "vocabulary")]
+            if inh_notes:
+                lines += [f"### From {group.name}", *[_bullet(n, src) for n in inh_notes], ""]
+
+    if isinstance(e, Location) and pack.scenes:
+        lines += ["## Scenes set here",
+                  *[f"- {s.number} · {s.name} `{s.id}`" for s in pack.scenes], ""]
+
+    proj_notes = [n for n in pack.project_notes if n.kind not in ("reference_image", "vocabulary")]
+    if proj_notes:
+        lines += ["## Project-wide", *[_bullet(n, src) for n in proj_notes], ""]
     return "\n".join(lines).rstrip() + "\n"
 
 

@@ -12,7 +12,7 @@ import re
 import urllib.parse
 import urllib.request
 
-from .ports import ImageHit, TermHit
+from .ports import ImageHit, TermHit, VerificationServiceError
 
 log = logging.getLogger(__name__)
 
@@ -61,13 +61,16 @@ class WikimediaImages:
     # --- terms ---
 
     def verify_term(self, term: str) -> TermHit | None:
-        """An article whose title or lead mentions the term. Unverified terms are dropped upstream."""
+        """An article whose title or lead mentions the term.
+
+        Returns None when the encyclopedia has no matching article (genuine no-match).
+        Raises VerificationServiceError when the API itself is unreachable.
+        """
         try:
             data = self._api(WIKIPEDIA_API, action="query", list="search", srsearch=term, srlimit=3,
                              srprop="snippet")
         except Exception as exc:
-            log.warning("term lookup failed for %r: %s", term, exc)
-            return None
+            raise VerificationServiceError(f"term lookup failed for {term!r}: {exc}") from exc
         results = data.get("query", {}).get("search", [])
         words = {w for w in re.findall(r"\w+", term.lower()) if len(w) > 2}
         for r in results:

@@ -287,6 +287,7 @@ def test_gemini_adapter_rejects_non_stop_responses():
     def llm_returning(reason, text='{"doc_type": "script"}'):
         llm = GeminiLLM.__new__(GeminiLLM)
         llm._s, llm.model_id = Settings(gcp_project="p", bucket="b"), "x"
+        llm.accumulated_usage = {}
 
         def gen(model, contents, config):
             assert config.max_output_tokens == 65_536

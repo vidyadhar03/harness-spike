@@ -1,9 +1,10 @@
 """Real-world visual references for a location.
 
-Three passes, each one reviewable on its own:
+Four passes, each one reviewable on its own:
   1. vocabulary  - turn the location's memory context into archive search terms
   2. verify      - confirm every term exists; unverified terms are dropped, never searched
-  3. curate      - retrieve licensed images, then group them into visual directions
+  3. retrieve    - fetch licensed images from Commons
+  4. curate      - caption in bounded batches, then group into visual directions
 
 Nothing here decides where to shoot. Results land as proposed reference_image notes on
 the location, so they go through the same review path as anything ingest wrote.
@@ -11,7 +12,13 @@ the location, so they go through the same review path as anything ingest wrote.
 from __future__ import annotations
 
 import hashlib
+import html
 import logging
+import mimetypes
+import re
+import tempfile
+import time
+import urllib.parse
 from collections import Counter
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
@@ -20,9 +27,14 @@ from pathlib import Path
 from .config import Settings
 from .files import extension_for
 from .ingest import PROMPTS, load_prompt, source_uri
-from .models import Location, Note, NoteOrigin, Provenance, Source
-from .ports import LLM, Blob, Blobs, ImageHit, Images, OutputTruncated, Store, T, Text, TermHit
-from .retrieval import get_context, render_context_md, resolve_scope
+from .models import Location, Note, NoteOrigin, Provenance, RetrievalOrigin, Source
+from .ports import (
+    LLM, Blob, Blobs, ImageHit, Images, OutputTruncated, ReplacementTooLarge,
+    Store, T, Text, TermHit, VerificationServiceError,
+)
+from .retrieval import (
+    get_references_context, render_references_context_md, resolve_scope,
+)
 from .schemas import CaptionsOut, CurateOut, VocabularyOut
 
 log = logging.getLogger(__name__)
@@ -33,6 +45,9 @@ FACET_LABELS = {"place": "Place", "terrain": "Terrain",
                 "architecture": "Architecture", "material": "Material"}
 REFERENCES_VERSION = "references-v2"
 CAPTION_BATCH = 8          # images per captioning call; halved on truncation
+
+# safe URL schemes for HTML export links
+_SAFE_URL_SCHEMES = frozenset({"http", "https"})
 
 
 @dataclass
@@ -45,22 +60,46 @@ class RefCtx:
 
 
 @dataclass
+class StageTiming:
+    """Elapsed time for one pipeline stage."""
+    name: str
+    elapsed_s: float
+    includes_downloads: bool = False
+
+
+@dataclass
 class ReferenceReport:
     scope_id: str
     location: str
     terms_proposed: int = 0
     terms_verified: list[str] = field(default_factory=list)
+    terms_bypassed: list[str] = field(default_factory=list)
     terms_dropped: list[str] = field(default_factory=list)
+    verification_failures: list[str] = field(default_factory=list)
     images_found: int = 0
     images_kept: int = 0
     images_uncaptioned: int = 0
+    candidates_retrieved: int = 0
+    candidates_evaluated: int = 0
+    candidates_omitted: int = 0
+    failed_downloads: int = 0
     kept: list[tuple[str, str]] = field(default_factory=list)       # (title, term and query that found it)
     origins: dict[str, str] = field(default_factory=dict)           # image key -> term and query
+    retrieval_origins_map: dict[str, list[RetrievalOrigin]] = field(default_factory=dict)
     directions: list[tuple[str, int]] = field(default_factory=list)
     facets: Counter = field(default_factory=Counter)
     notes_written: int = 0
     notes_replaced: int = 0
+    notes_skipped_reviewed: int = 0
     warnings: list[str] = field(default_factory=list)
+    # performance
+    stage_timings: list[StageTiming] = field(default_factory=list)
+    cache_hits: int = 0
+    cache_downloads: int = 0
+    model_calls: int = 0
+    http_retries: int = 0
+    truncation_retries: int = 0
+    token_usage: dict[str, int] = field(default_factory=dict)
 
     def warn(self, msg: str) -> None:
         log.warning("%s: %s", self.location, msg)
@@ -75,42 +114,130 @@ def references_version(llm: LLM) -> str:
     return f"{REFERENCES_VERSION}-{h.hexdigest()[:8]}"
 
 
+# --- preview cache ----------------------------------------------------------------
+
+class RunLocalImageCache:
+    """Bounded, run-local preview cache that guarantees the exact bytes evaluated by
+    the model are the exact bytes stored.
+
+    Bound by total byte size. Uses temporary files to avoid holding all images in
+    memory while still preventing re-downloads.
+    """
+
+    def __init__(self, images: Images, max_bytes: int = 200 * 1024 * 1024):
+        self._images = images
+        self._max_bytes = max_bytes
+        self._cache: dict[str, Path] = {}   # url -> temp file path
+        self._total_bytes = 0
+        self._tmpdir: tempfile.TemporaryDirectory | None = None
+        self.hits = 0
+        self.downloads = 0
+
+    def _ensure_tmpdir(self) -> Path:
+        if self._tmpdir is None:
+            self._tmpdir = tempfile.TemporaryDirectory(prefix="harness_ref_cache_")
+        return Path(self._tmpdir.name)
+
+    def fetch(self, url: str) -> bytes:
+        """Fetch preview bytes, using cache on repeat access."""
+        cached = self._cache.get(url)
+        if cached is not None and cached.exists():
+            self.hits += 1
+            return cached.read_bytes()
+
+        data = self._images.fetch(url)
+        self.downloads += 1
+
+        if self._total_bytes + len(data) <= self._max_bytes:
+            tmpdir = self._ensure_tmpdir()
+            fname = hashlib.sha256(url.encode()).hexdigest()[:16]
+            path = tmpdir / fname
+            path.write_bytes(data)
+            self._cache[url] = path
+            self._total_bytes += len(data)
+
+        return data
+
+    def cleanup(self) -> None:
+        if self._tmpdir is not None:
+            self._tmpdir.cleanup()
+            self._tmpdir = None
+            self._cache.clear()
+            self._total_bytes = 0
+
+    def verify_term(self, term: str) -> TermHit | None:
+        return self._images.verify_term(term)
+
+    def search_images(self, term: str, limit: int, region: str | None = None,
+                      region_title: str | None = None) -> list[ImageHit]:
+        return self._images.search_images(term, limit, region=region, region_title=region_title)
+
+
+# --- main entry -------------------------------------------------------------------
+
 def suggest_references(ctx: RefCtx, project_id: str, scope_ref: str, *, per_term: int = 6,
                        max_images: int = 32, dry_run: bool = False,
-                       terms_only: bool = False) -> ReferenceReport:
+                       terms_only: bool = False,
+                       bypass_verification: bool = False) -> ReferenceReport:
+    t_total = time.monotonic()
     scope_id = resolve_scope(ctx.store, project_id, scope_ref)
     entity = ctx.store.get_entity(project_id, scope_id)
     if not isinstance(entity, Location):
         raise ValueError(f"references are per location; {scope_ref!r} resolved to a {type(entity).__name__.lower()}")
 
-    pack = get_context(ctx.store, project_id, scope_id)
-    context_md = render_context_md(pack)
+    pack = get_references_context(ctx.store, project_id, scope_id)
+    context_md = render_references_context_md(pack)
     report = ReferenceReport(scope_id=scope_id, location=entity.name)
     version = references_version(ctx.llm)
 
-    vocab = _vocabulary(ctx, context_md, report)
-    verified = _verify(ctx, vocab, report)
-    if not verified:
-        report.warn("no search terms survived verification; nothing to retrieve")
-        return report
+    cache = RunLocalImageCache(ctx.images)
+    cached_ctx = RefCtx(store=ctx.store, blobs=ctx.blobs, llm=ctx.llm,
+                        images=cache, settings=ctx.settings)
+    try:
+        t0 = time.monotonic()
+        vocab = _vocabulary(cached_ctx, context_md, report)
+        report.stage_timings.append(StageTiming("vocabulary", time.monotonic() - t0))
 
-    if terms_only:
-        return report      # tuning the vocabulary costs one model call, not dozens of fetches
+        t0 = time.monotonic()
+        verified = _verify(cached_ctx, vocab, report, bypass=bypass_verification)
+        report.stage_timings.append(StageTiming("verification", time.monotonic() - t0))
+        if not verified:
+            report.warn("no search terms survived verification; nothing to retrieve")
+            return report
 
-    hits = _retrieve(ctx, vocab, verified, per_term, max_images, report)
-    if not hits:
-        report.warn("no licensed images found for the verified terms")
-    curated = _curate(ctx, context_md, hits, report) if hits else ([], {}, {})
+        if terms_only:
+            return report
 
-    if dry_run:
-        return report
-    _write(ctx, project_id, scope_id, version, vocab, verified, hits, curated, report)
+        t0 = time.monotonic()
+        hits = _retrieve(cached_ctx, vocab, verified, per_term, max_images, report)
+        report.stage_timings.append(StageTiming("retrieval", time.monotonic() - t0, includes_downloads=True))
+        if not hits:
+            report.warn("no licensed images found for the verified terms")
+        curated = _curate(cached_ctx, context_md, hits, report) if hits else ([], {}, {})
+
+        if dry_run:
+            return report
+        _write(cached_ctx, project_id, scope_id, version, vocab, verified, hits, curated, report)
+    finally:
+        report.cache_hits = cache.hits
+        report.cache_downloads = cache.downloads
+        report.stage_timings.append(StageTiming("total", time.monotonic() - t_total, includes_downloads=True))
+        _collect_token_usage(ctx.llm, report)
+        cache.cleanup()
     return report
+
+
+def _collect_token_usage(llm: LLM, report: ReferenceReport) -> None:
+    usage = getattr(llm, "accumulated_usage", None)
+    if isinstance(usage, dict):
+        report.token_usage = dict(usage)
+    report.http_retries = getattr(llm, "http_retries", 0)
 
 
 # --- passes -------------------------------------------------------------------------
 
 def _vocabulary(ctx: RefCtx, context_md: str, report: ReferenceReport) -> VocabularyOut:
+    report.model_calls += 1
     out = ctx.llm.generate(system=load_prompt("vocabulary"), parts=[Text(context_md)], schema=VocabularyOut)
     seen, terms = set(), []
     for t in out.terms:
@@ -123,18 +250,50 @@ def _vocabulary(ctx: RefCtx, context_md: str, report: ReferenceReport) -> Vocabu
     return out
 
 
-def _verify(ctx: RefCtx, vocab: VocabularyOut, report: ReferenceReport) -> list[tuple[str, TermHit]]:
+def _verify(ctx: RefCtx, vocab: VocabularyOut, report: ReferenceReport, *,
+            bypass: bool = False) -> list[tuple[str, TermHit]]:
     """A term the encyclopedia does not recognise is usually invented, and searching it
-    returns plausible-looking rubbish, so it is dropped rather than downweighted."""
+    returns plausible-looking rubbish, so it is dropped rather than downweighted.
+
+    When bypass=True, terms without Wikipedia hits are accepted using synthetic fallbacks
+    rather than dropped, but successful Wikipedia hits (such as canonical region titles like
+    "Kinnaur district" for "Kinnaur") are preserved for Commons category resolution.
+    If a region term lacks canonical resolution, a warning is recorded.
+    """
     verified: list[tuple[str, TermHit]] = []
     for t in vocab.terms:
         log.info("verifying term %r", t.term)
-        hit = ctx.images.verify_term(t.term)
+        try:
+            hit = ctx.images.verify_term(t.term)
+        except VerificationServiceError as exc:
+            report.verification_failures.append(t.term)
+            if bypass:
+                # accept the term without verified metadata
+                hit = TermHit(title=t.term, url="", snippet="")
+                verified.append((t.term, hit))
+                report.terms_bypassed.append(t.term)
+                log.info("verification bypassed for %r (service error: %s)", t.term, exc)
+                if t.kind == "region":
+                    report.warn(f"region {t.term!r} lacks canonical resolution (service error: {exc}); using fallback title which may degrade category resolution")
+            else:
+                report.warn(f"verification service unavailable for {t.term!r}: {exc}")
+            continue
         if hit is None:
-            report.terms_dropped.append(t.term)
+            if bypass:
+                hit = TermHit(title=t.term, url="", snippet="")
+                verified.append((t.term, hit))
+                report.terms_bypassed.append(t.term)
+                log.info("verification bypassed for %r (no match)", t.term)
+                if t.kind == "region":
+                    report.warn(f"region {t.term!r} lacks canonical resolution; using fallback title which may degrade category resolution")
+            else:
+                report.terms_dropped.append(t.term)
             continue
         verified.append((t.term, hit))
         report.terms_verified.append(t.term)
+    # if service failures prevented all verification and bypass is off, leave prior proposals intact
+    if not verified and report.verification_failures and not bypass:
+        report.warn("all terms failed service verification; previous proposals left intact")
     return verified
 
 
@@ -174,9 +333,16 @@ def _retrieve(ctx: RefCtx, vocab: VocabularyOut, verified: list[tuple[str, TermH
         if not found:
             report.warn(f"{term!r} returned no licensed images")
         report.images_found += len(found)
+        report.candidates_retrieved += len(found)
         per_term_hits.append(found)
+
+        # build structured retrieval origins
+        region_val = term if spec.kind == "region" else None
+        origin = RetrievalOrigin(term=term, query=term, region=region_val, via=via)
         for h in found:
-            report.origins.setdefault(h.image_url or h.page_url, f"{term} ({via})")
+            key = h.image_url or h.page_url
+            report.origins.setdefault(key, f"{term} ({via})")
+            report.retrieval_origins_map.setdefault(key, []).append(origin)
 
     seen: set[str] = set()
     out: list[ImageHit] = []
@@ -222,6 +388,7 @@ def caption_parts(images: Images, context_md: str, hits: list[ImageHit], indices
         try:
             data = images.fetch(hit.preview_url)
         except Exception as exc:
+            report.failed_downloads += 1
             report.warn(f"could not fetch image {i} ({hit.title}): {exc}")
             continue
         present.append(i)
@@ -255,10 +422,12 @@ def _caption(ctx: RefCtx, context_md: str, hits: list[ImageHit], indices: list[i
     if not present:
         return {}, {}
 
+    report.model_calls += 1
     try:
         out = ctx.llm.generate(system=load_prompt("caption_references"), parts=parts,
                                schema=CaptionsOut)
-    except OutputTruncated as exc:
+    except OutputTruncated:
+        report.truncation_retries += 1
         if len(present) == 1:
             report.warn(f"image {present[0]} could not be captioned within the output budget; skipped")
             return {}, {}
@@ -284,7 +453,10 @@ def _curate(ctx: RefCtx, context_md: str, hits: list[ImageHit], report: Referenc
     small judgement over text. Keeping them apart stops the whole pass from growing with
     the number of images retrieved.
     """
+    report.candidates_evaluated = len(hits)
+    t0 = time.monotonic()
     captions, facets = caption_all(ctx, context_md, hits, report)
+    report.stage_timings.append(StageTiming("captioning", time.monotonic() - t0, includes_downloads=True))
     order = list(range(len(hits)))
 
     uncaptioned = [i for i in order if i not in captions]
@@ -292,26 +464,30 @@ def _curate(ctx: RefCtx, context_md: str, hits: list[ImageHit], report: Referenc
         report.warn(f"{len(uncaptioned)} image(s) judged irrelevant and left uncaptioned: "
                     + ", ".join(hits[i].title[:40] for i in uncaptioned))
     if not captions:
+        report.images_kept = 0
+        report.candidates_omitted = len(hits)
+        report.images_uncaptioned = len(uncaptioned)
         return [], {}, {}
 
+    t0 = time.monotonic()
     listing = "\n".join(f"[{i}] ({facets.get(i, 'place')}) {captions[i]}" for i in sorted(captions))
+    report.model_calls += 1
     out = ctx.llm.generate(system=load_prompt("group_references"),
                            parts=[Text(context_md), Text("Captioned images:\n" + listing)],
                            schema=CurateOut)
+    report.stage_timings.append(StageTiming("grouping", time.monotonic() - t0))
 
     directions: list[tuple[str, str, list[int]]] = []
     placed: set[int] = set()
     for d in out.directions:
         members = [i for i in d.images if i in captions and i not in placed]
         if not members:
-            # a named direction with no usable images is the model changing its mind mid-answer
             report.warn(f"direction {d.name.strip() or 'unnamed'!r} named no usable images; dropped")
             continue
         placed |= set(members)
         directions.append((d.name.strip() or "Untitled direction", d.why.strip(), members))
 
-    # a captioned image the model forgot to file is still a usable reference: keep it rather
-    # than silently discarding work the director may want
+    # a captioned image the model forgot to file is still a usable reference
     unplaced = [i for i in captions if i not in placed]
     if unplaced:
         report.warn(f"{len(unplaced)} captioned image(s) were not placed in a direction; "
@@ -320,6 +496,7 @@ def _curate(ctx: RefCtx, context_md: str, hits: list[ImageHit], report: Referenc
         placed |= set(unplaced)
 
     report.images_kept = len(placed)
+    report.candidates_omitted = len(hits) - len(placed)
     report.kept = [(hits[i].title, report.origins.get(hits[i].image_url or hits[i].page_url, ""))
                    for _, _, members in directions for i in members]
     report.images_uncaptioned = len(uncaptioned)
@@ -330,10 +507,13 @@ def _curate(ctx: RefCtx, context_md: str, hits: list[ImageHit], report: Referenc
 
 # --- write-back -----------------------------------------------------------------------
 
-def _store_image(ctx: RefCtx, project_id: str, hit: ImageHit) -> Source | None:
+def _store_image(ctx: RefCtx, project_id: str, hit: ImageHit,
+                 report: ReferenceReport | None = None) -> Source | None:
     try:
         data = ctx.images.fetch(hit.preview_url)
     except Exception as exc:
+        if report is not None:
+            report.failed_downloads += 1
         log.warning("could not fetch %s: %s", hit.preview_url, exc)
         return None
     sid = hashlib.sha256(data).hexdigest()
@@ -360,7 +540,8 @@ def _vocabulary_note(scope_id: str, version: str, vocab: VocabularyOut,
         f"{term} ({by_term[term].kind})" if term in by_term else term for term, _ in verified))
     return Note(
         kind="vocabulary", body="\n".join(lines)[:2000], owner_id=scope_id, author="agent",
-        provenance=[Provenance(url=hit.url, title=hit.title) for _, hit in verified[:8]],
+        provenance=[Provenance(url=hit.url, title=hit.title)
+                    for _, hit in verified if hit.url and hit.url.strip()][:8],
         origin=NoteOrigin(producer=PRODUCER, scope=scope_id, digest_version=version),
     )
 
@@ -368,42 +549,255 @@ def _vocabulary_note(scope_id: str, version: str, vocab: VocabularyOut,
 def _write(ctx: RefCtx, project_id: str, scope_id: str, version: str, vocab: VocabularyOut,
            verified: list[tuple[str, TermHit]], hits: list[ImageHit],
            curated: tuple[list, dict, dict], report: ReferenceReport) -> None:
+    t0 = time.monotonic()
     directions, captions, facets = curated
-    notes: list[Note] = [_vocabulary_note(scope_id, version, vocab, verified)]
+
+    # Phase 1: prepare all images first, before touching any notes
+    prepared_notes: list[Note] = [_vocabulary_note(scope_id, version, vocab, verified)]
     for name, why, members in directions:
         for i in members:
-            # the facet is the heading, because "could stand in for Devgram" and "right
-            # stonework, wrong country" are what a reader needs to tell apart first. The
-            # direction names the look and rides with the caption, so one direction spanning
-            # several facets stays one idea instead of becoming a repeated heading.
             group = FACET_LABELS.get(facets.get(i, "place"), "Place")
-            body = f"{name} — {captions[i]}" if name != UNSORTED else captions[i]
-            src = _store_image(ctx, project_id, hits[i])
+            body = f"{name} \u2014 {captions[i]}" if name != UNSORTED else captions[i]
+            src = _store_image(ctx, project_id, hits[i], report)
             if src is None:
                 report.warn(f"image {i} could not be stored; skipped")
                 continue
-            notes.append(Note(
+            key = hits[i].image_url or hits[i].page_url
+            origins = report.retrieval_origins_map.get(key, [])
+            prepared_notes.append(Note(
                 kind="reference_image", body=body[:2000], owner_id=scope_id,
                 author="agent", group=group,
+                direction=name if name != UNSORTED else None,
+                direction_rationale=why if why else None,
                 provenance=[Provenance(source_id=src.id, url=hits[i].page_url or None,
-                                       title=hits[i].title or None)],
+                                       title=hits[i].title or None,
+                                       retrieval_origins=origins)],
                 origin=NoteOrigin(producer=PRODUCER, scope=scope_id, digest_version=version),
             ))
 
+    # Phase 2: re-read current state to protect reviews made during generation
     existing = [n for n in ctx.store.notes_for_owners(project_id, [scope_id])
                 if n.origin and n.origin.producer == PRODUCER and n.origin.scope == scope_id]
-    stale = [n.id for n in existing if n.status == "proposed"]
+    stale_ids = [n.id for n in existing if n.status == "proposed"]
+    expected_status = {n.id: n.status for n in existing}
     reviewed = {_key(n) for n in existing if n.status != "proposed"}
-    fresh = [n for n in notes if _key(n) not in reviewed]
-    if stale:
-        ctx.store.delete_notes(project_id, stale)
-    if fresh:
-        ctx.store.put_notes(project_id, fresh)
-    report.notes_replaced = len(stale)
+    fresh = [n for n in prepared_notes if _key(n) not in reviewed]
+
+    # Phase 3: atomic replacement
+    ctx.store.replace_notes(project_id, stale_ids, fresh, expected_status=expected_status)
+
+    report.notes_replaced = len(stale_ids)
     report.notes_written = len(fresh)
+    report.stage_timings.append(StageTiming("persistence", time.monotonic() - t0, includes_downloads=True))
 
 
 def _key(n: Note) -> tuple:
     """A reviewed image keeps its verdict across re-runs; its identity is the file, not the caption."""
     src = next((p.source_id for p in n.provenance if p.source_id), None)
     return (n.kind, src) if n.kind == "reference_image" else (n.kind, " ".join(n.body.lower().split()))
+
+
+# --- HTML export ------------------------------------------------------------------
+
+def _safe_url(url: str | None) -> str | None:
+    """Return url only if it uses a safe scheme; prevents javascript: etc in HTML output."""
+    if url is None:
+        return None
+    try:
+        parsed = urllib.parse.urlparse(url)
+        return url if parsed.scheme in _SAFE_URL_SCHEMES else None
+    except Exception:
+        return None
+
+
+def _mime_ext(mime_type: str) -> str:
+    """Return a file extension matching the MIME type, not blindly .jpg."""
+    ext = mimetypes.guess_extension(mime_type or "image/jpeg")
+    return ext or ".jpg"
+
+
+def strip_heading_prefix(caption: str, heading: str | None = None) -> str:
+    """Remove repeated group-name prefix from displayed captions when the heading already supplies the name.
+
+    Preserves legacy stored content in the store while presenting clean card text.
+    """
+    if not caption:
+        return ""
+    if heading and heading != UNSORTED:
+        pattern = rf"^{re.escape(heading.strip())}\s*[\u2014\u2013\-\:]+\s*"
+        if re.match(pattern, caption, flags=re.IGNORECASE):
+            return re.sub(pattern, "", caption, count=1, flags=re.IGNORECASE).strip()
+    return caption
+
+
+def export_references_html(store: Store, blobs: Blobs, project_id: str, scope_ref: str,
+                           out_dir: str | Path, *, confirmed_only: bool = False,
+                           include_rejected: bool = False) -> tuple[Path, int, str | None]:
+    """Export stored references as a self-contained HTML file with local images.
+
+    Reads stored notes; does not repeat search or model calls.
+    Returns ``(html_path, count, hint)`` where:
+    - ``count`` is the number of references written to the file.
+    - ``hint`` is ``None`` when count > 0, or a short sentence explaining why
+      count is zero (no stored references vs. filtered to zero).
+    """
+    from .retrieval import get_context, _reference, _all_notes
+
+    out_dir = Path(out_dir)
+    images_dir = out_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    scope_id = resolve_scope(store, project_id, scope_ref)
+    entity = store.get_entity(project_id, scope_id)
+    if not isinstance(entity, Location):
+        raise ValueError(f"export is per location; {scope_ref!r} resolved to a {type(entity).__name__.lower()}")
+
+    pack = get_context(store, project_id, scope_id)
+    all_notes = _all_notes(pack)
+    sources_map = store.get_sources(project_id, [p.source_id for n in all_notes for p in n.provenance if p.source_id])
+
+    # collect reference notes by status
+    all_ref_notes = [n for n in all_notes
+                     if n.kind == "reference_image"
+                     and n.origin is not None and n.origin.producer == PRODUCER]
+    ref_notes = list(all_ref_notes)
+    if confirmed_only:
+        ref_notes = [n for n in ref_notes if n.status == "confirmed"]
+    elif not include_rejected:
+        ref_notes = [n for n in ref_notes if n.status != "rejected"]
+
+    # group by direction (or fallback for older notes without structured direction)
+    groups: dict[str, list[tuple[Note, Source | None]]] = {}
+    for n in ref_notes:
+        direction = n.direction or n.group or "Unsorted"
+        src = sources_map.get(n.provenance[0].source_id) if n.provenance else None
+        groups.setdefault(direction, []).append((n, src))
+
+    # download images locally
+    local_images: dict[str, str] = {}  # source_id -> local relative path
+    for n, src in [(n, s) for ns in groups.values() for n, s in ns]:
+        if src is None:
+            continue
+        sid = src.id
+        if sid in local_images:
+            continue
+        ext = _mime_ext(src.mime_type)
+        local_path = images_dir / f"{sid}{ext}"
+        if not local_path.exists():
+            try:
+                data = blobs.get(src.storage_path)
+                local_path.write_bytes(data)
+            except Exception as exc:
+                log.warning("could not download image %s: %s", sid, exc)
+                continue
+        local_images[sid] = f"images/{sid}{ext}"
+
+    # build HTML
+    esc = html.escape
+    parts = [f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{esc(entity.name)} \u2014 Visual References</title>
+<style>
+body {{ font-family: system-ui, sans-serif; margin: 2em; background: #fafafa; color: #222; }}
+h1 {{ border-bottom: 2px solid #333; padding-bottom: 0.3em; }}
+h2 {{ color: #555; margin-top: 1.5em; }}
+.card {{ display: inline-block; vertical-align: top; width: 320px; margin: 12px;
+         background: white; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.12);
+         overflow: hidden; }}
+.card .img-link {{ display: block; background: #f0f0f0; text-decoration: none; border-bottom: 1px solid #eee; }}
+.card img {{ width: 100%; height: auto; max-height: 280px; object-fit: contain; display: block; }}
+.card .placeholder {{ width: 100%; height: 200px; background: #ddd; display: flex;
+                      align-items: center; justify-content: center; color: #999; font-size: 14px; }}
+.card .body {{ padding: 10px; font-size: 13px; }}
+.badge {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px;
+          margin-right: 4px; }}
+.badge-proposed {{ background: #fff3cd; color: #856404; }}
+.badge-confirmed {{ background: #d4edda; color: #155724; }}
+.badge-rejected {{ background: #f8d7da; color: #721c24; }}
+.meta {{ color: #888; font-size: 11px; margin-top: 6px; }}
+.guidance {{ color: #0056b3; font-style: italic; margin-top: 4px; }}
+a {{ color: #0066cc; text-decoration: none; }}
+a:hover {{ text-decoration: underline; }}
+</style>
+</head>
+<body>
+<h1>{esc(entity.name)} \u2014 Visual References</h1>
+"""]
+
+    facet_order = ["Place", "Terrain", "Architecture", "Material"]
+
+    def sort_key(name):
+        try:
+            return (0, facet_order.index(name))
+        except ValueError:
+            return (1, name)
+
+    for direction in sorted(groups, key=sort_key):
+        items = groups[direction]
+        parts.append(f"<h2>{esc(direction)}</h2>\n")
+        rationale = next((n.direction_rationale for n, _ in items if n.direction_rationale), None)
+        if rationale:
+            parts.append(f"<p><em>{esc(rationale)}</em></p>\n")
+        for note, src in items:
+            parts.append('<div class="card">\n')
+            display_cap = strip_heading_prefix(note.body, direction)
+            if src and src.id in local_images:
+                img_path = local_images[src.id]
+                parts.append(f'  <a class="img-link" href="{esc(img_path)}" target="_blank" rel="noopener" title="View full preview">\n'
+                             f'    <img src="{esc(img_path)}" alt="{esc(display_cap[:80])}">\n'
+                             f'  </a>\n')
+            else:
+                parts.append('  <div class="placeholder">Image unavailable</div>\n')
+
+            parts.append('  <div class="body">\n')
+            badge_cls = f"badge-{note.status}"
+            parts.append(f'    <span class="badge {badge_cls}">{esc(note.status)}</span>')
+            facet = note.group
+            if facet:
+                parts.append(f' <span class="badge">{esc(facet)}</span>')
+            parts.append(f'\n    <p>{esc(display_cap[:500])}</p>\n')
+
+            if note.guidance:
+                parts.append(f'    <p class="guidance">Guidance: {esc(note.guidance)}</p>\n')
+
+            meta_parts = []
+            if src:
+                safe = _safe_url(src.origin_url)
+                if safe:
+                    meta_parts.append(f'<a href="{esc(safe)}" target="_blank" rel="noopener">{esc(src.filename)}</a>')
+                else:
+                    meta_parts.append(esc(src.filename))
+                if src.attribution:
+                    meta_parts.append(esc(src.attribution))
+                if src.license:
+                    meta_parts.append(esc(src.license))
+            meta_parts.append(f"<code>{esc(note.id)}</code>")
+            parts.append(f'    <p class="meta">{" \u00b7 ".join(meta_parts)}</p>\n')
+            parts.append('  </div>\n</div>\n')
+
+    # empty-state message when no references matched
+    if not ref_notes:
+        if not all_ref_notes:
+            hint = "No references have been generated for this location yet. Run 'harness-memory references' first."
+        else:
+            active = [n for n in all_ref_notes if n.status != "rejected"]
+            if confirmed_only and not any(n.status == "confirmed" for n in all_ref_notes):
+                hint = f"No confirmed references yet ({len(all_ref_notes)} proposed). Confirm some with 'harness-memory confirm'."
+            elif not include_rejected and len(active) == 0:
+                hint = f"All {len(all_ref_notes)} reference(s) have been rejected."
+            else:
+                hint = f"All references were excluded by the active filters ({len(all_ref_notes)} total stored)."
+        parts.append(
+            f'<p style="color:#888;font-style:italic;margin-top:2em">{esc(hint)}</p>\n'
+        )
+    else:
+        hint = None
+
+    parts.append("</body>\n</html>\n")
+
+    html_path = out_dir / f"{re.sub(r'[^a-z0-9]+', '-', entity.name.lower()).strip('-')}-references.html"
+    html_path.write_text("".join(parts), encoding="utf-8")
+    return html_path, len(ref_notes), hint

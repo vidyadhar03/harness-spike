@@ -129,6 +129,13 @@ class Source(Doc):
 EntityStatus = Literal["proposed", "confirmed", "rejected", "merged"]
 
 
+class RetrievalOrigin(Strict):
+    term: str
+    query: str
+    region: str | None = None
+    via: str = ""
+
+
 class Provenance(Strict):
     """One source occurrence supporting a note.
 
@@ -145,6 +152,8 @@ class Provenance(Strict):
     extracted_body: str | None = Field(default=None, max_length=2000)
     extracted_owner_id: str | None = None
     link_status: ReviewStatus = "proposed"             # does this occurrence support the note?
+    retrieval_origins: list[RetrievalOrigin] = Field(default_factory=list)
+    depicted_place: str | None = None
 
     @model_validator(mode="after")
     def _anchored(self):
@@ -243,6 +252,9 @@ class Note(Doc):
     author: Author
     group: str | None = None            # optional cluster label, e.g. a visual direction
     origin: NoteOrigin | None = None
+    guidance: str | None = Field(default=None, max_length=1000)
+    direction: str | None = None
+    direction_rationale: str | None = None
 
     revision: int = Field(default=1, ge=1)
     reviewed_revision: int | None = None
@@ -254,7 +266,7 @@ class Note(Doc):
 
     @model_validator(mode="after")
     def _rules(self):
-        if self.author == "agent" and not self.provenance:
+        if self.author == "agent" and not self.provenance and self.kind != "vocabulary":
             raise ValueError("agent notes require provenance")
         if self.kind == "reference_image" and len(self.provenance) != 1:
             raise ValueError("reference_image notes point at exactly one image or page")
@@ -286,10 +298,19 @@ class ReferenceImage(Strict):
     status: ReviewStatus
     source_id: str
     page: int | None = None
-    group: str | None = None
+    group: str | None = None            # authoritative facet: "Place", "Terrain", etc.
     origin_url: str | None = None
     license: str | None = None
     attribution: str | None = None
+    guidance: str | None = None
+    direction: str | None = None
+    direction_rationale: str | None = None
+    retrieval_origins: list[RetrievalOrigin] = Field(default_factory=list)
+    depicted_place: str | None = None
+
+    @property
+    def facet(self) -> str | None:
+        return self.group
 
 
 class InheritedNotes(Strict):

@@ -7,11 +7,12 @@
   harness-memory index <project_id>
   harness-memory context <project_id> "Devgram well" [--confirmed-only] [-o CONTEXT.md]
   harness-memory export <project_id> ./context_export [--confirmed-only]
-  harness-memory references <project_id> "Devgram well" [--terms-only | --dry-run]
+  harness-memory references <project_id> "Devgram well" [--terms-only | --dry-run] [--bypass-term-verification]
+  harness-memory export-references <project_id> "Devgram well" -o ./refs [--confirmed-only] [--include-rejected]
   harness-memory caption-eval capture <project_id> "Devgram" -o evals/devgram_candidates.json [--include "File title"]
   harness-memory caption-eval run evals/devgram_candidates.json [-n 3] [--no-reasons] [-o REPORT.md]
   harness-memory merge <project_id> "Approach Road" "Village Road" [--dry-run]
-  harness-memory confirm <project_id> <note_id> [--by NAME]
+  harness-memory confirm <project_id> <note_id> [--by NAME] [--guidance TEXT]
   harness-memory reject <project_id> <note_id> --reason wrong_scope [--duplicate-of NOTE_ID]
   harness-memory set-parent <project_id> "Market Square" "Devgram" [--by NAME]
   harness-memory confirm-parent <project_id> "Market Square" [--by NAME]
@@ -28,7 +29,7 @@ from .config import Settings
 from .ingest import Ctx, IngestReport, ingest_lock, ingest_source, register_file
 from .models import Location, Project, Scene
 from .curate import merge_entities, review_containment, review_note
-from .references import RefCtx, ReferenceReport, suggest_references
+from .references import RefCtx, ReferenceReport, export_references_html, suggest_references
 from .retrieval import export_context, get_context, render_context_md, render_index_md
 
 
@@ -83,24 +84,56 @@ def print_report(r: IngestReport) -> None:
 
 
 def print_references(r: ReferenceReport) -> None:
-    line = f"{r.location}: {len(r.terms_verified)}/{r.terms_proposed} terms verified"
-    if r.images_found or r.images_kept:
-        line += (f", {r.images_kept}/{r.images_found} images kept"
-                 + (f" ({r.images_uncaptioned} judged irrelevant)" if r.images_uncaptioned else ""))
+    terms_part = f"{len(r.terms_verified)}/{r.terms_proposed} terms verified"
+    if r.terms_bypassed:
+        terms_part += f", {len(r.terms_bypassed)} accepted without match"
+    line = f"{r.location}: {terms_part}"
+    if r.verification_failures:
+        line += f" ({len(r.verification_failures)} service failures)"
+    evaluated = r.candidates_evaluated or (r.images_kept + r.images_uncaptioned)
+    if evaluated or r.images_kept:
+        line += f", {r.images_kept}/{evaluated} evaluated kept"
     line += f", {r.notes_written} notes ({r.notes_replaced} replaced)"
     print(line)
+    retrieved = r.candidates_retrieved or r.images_found
+    omitted = r.candidates_omitted if r.candidates_evaluated else r.images_uncaptioned
+    if retrieved or evaluated or r.images_kept:
+        print(f"  candidates: {retrieved} retrieved, {evaluated} evaluated, "
+              f"{r.images_kept} kept, {omitted} omitted, {r.failed_downloads} failed downloads")
     if r.terms_verified:
         print("  terms:   " + ", ".join(r.terms_verified))
+    if r.terms_bypassed:
+        print("  bypassed: " + ", ".join(r.terms_bypassed))
     if r.terms_dropped:
         print("  dropped: " + ", ".join(r.terms_dropped))
+    if r.verification_failures:
+        print("  svc fail: " + ", ".join(r.verification_failures))
     if r.facets:
-        # how many images could stand in for the place, vs only share its terrain or stonework
         print("  facets:  " + ", ".join(f"{v} {k}" for k, v in sorted(r.facets.items())))
     for name, count in r.directions:
         print(f"  · {name} ({count} images)")
     for title, origin in r.kept:
-        # whether region scoping earns its keep: which searches the surviving images came from
         print(f"    kept: {title[:70]}  <- {origin}")
+    # performance summary
+    if r.stage_timings:
+        timing_parts = []
+        for st in r.stage_timings:
+            suffix = " (incl. downloads)" if st.includes_downloads else ""
+            timing_parts.append(f"{st.name}={st.elapsed_s:.1f}s{suffix}")
+        print("  timing: " + ", ".join(timing_parts))
+    if r.cache_downloads or r.cache_hits:
+        print(f"  cache:   {r.cache_downloads} downloads, {r.cache_hits} hits")
+    if r.model_calls:
+        retries = []
+        if r.http_retries:
+            retries.append(f"{r.http_retries} HTTP retry" if r.http_retries == 1 else f"{r.http_retries} HTTP retries")
+        if r.truncation_retries:
+            retries.append(f"{r.truncation_retries} truncation retries")
+        retries_str = f" ({', '.join(retries)})" if retries else ""
+        print(f"  model:   {r.model_calls} logical calls{retries_str}")
+    if r.token_usage:
+        parts = [f"{k}={v}" for k, v in sorted(r.token_usage.items())]
+        print("  tokens:  " + ", ".join(parts))
     for w in r.warnings[:10]:
         print(f"    warn: {w}")
 
@@ -173,6 +206,14 @@ def main(argv: list[str] | None = None) -> int:
     rf.add_argument("--dry-run", action="store_true", help="run the passes, write nothing")
     rf.add_argument("--terms-only", action="store_true",
                     help="stop after vocabulary verification; no image search or fetch")
+    rf.add_argument("--bypass-term-verification", action="store_true",
+                    help="accept all terms without Wikipedia verification (experimental)")
+    er = sub.add_parser("export-references")
+    er.add_argument("project_id")
+    er.add_argument("scope", help="location id, name, or alias")
+    er.add_argument("-o", "--out", required=True, help="output directory")
+    er.add_argument("--confirmed-only", action="store_true")
+    er.add_argument("--include-rejected", action="store_true")
     ce = sub.add_parser("caption-eval").add_subparsers(dest="action", required=True)
     cec = ce.add_parser("capture", help="freeze one run's candidate images and context pack as a fixture")
     cec.add_argument("project_id")
@@ -196,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
     cf.add_argument("project_id")
     cf.add_argument("note_id")
     cf.add_argument("--by", default="user")
+    cf.add_argument("-g", "--guidance", help="director guidance for this reference (reference_image only)")
     rj = sub.add_parser("reject")
     rj.add_argument("project_id")
     rj.add_argument("note_id")
@@ -224,7 +266,7 @@ def main(argv: list[str] | None = None) -> int:
         return caption_eval_cmd(args, settings)
     store_only = args.cmd in ("status", "index", "context", "export", "merge",
                               "confirm", "reject", "set-parent", "confirm-parent")
-    if args.cmd == "references":
+    if args.cmd in ("references", "export-references"):
         ctx = None
         ref_ctx = build_ref_ctx(settings)
         store = ref_ctx.store
@@ -265,11 +307,29 @@ def main(argv: list[str] | None = None) -> int:
             report = suggest_references(ref_ctx, args.project_id, args.scope, per_term=args.per_term,
                                         max_images=args.max_images,
                                         dry_run=args.dry_run or args.terms_only,
-                                        terms_only=args.terms_only)
-        except (LookupError, ValueError) as exc:
+                                        terms_only=args.terms_only,
+                                        bypass_verification=args.bypass_term_verification)
+        except (LookupError, ValueError, RuntimeError) as exc:
             print(exc, file=sys.stderr)
             return 1
         print_references(report)
+        return 0
+
+    if args.cmd == "export-references":
+        try:
+            html_path, ref_count, hint = export_references_html(
+                ref_ctx.store, ref_ctx.blobs, args.project_id, args.scope,
+                args.out, confirmed_only=args.confirmed_only,
+                include_rejected=args.include_rejected)
+        except (LookupError, ValueError) as exc:
+            print(exc, file=sys.stderr)
+            return 1
+        if ref_count == 0:
+            print(f"0 references exported → {html_path}")
+            if hint:
+                print(f"  {hint}", file=sys.stderr)
+        else:
+            print(f"{ref_count} reference(s) exported → {html_path}")
         return 0
 
     if args.cmd == "merge":
@@ -286,7 +346,8 @@ def main(argv: list[str] | None = None) -> int:
             result = review_note(store, args.project_id, args.note_id,
                                  "confirmed" if args.cmd == "confirm" else "rejected",
                                  reviewer=args.by, reason=getattr(args, "reason", None),
-                                 duplicate_of=getattr(args, "duplicate_of", None))
+                                 duplicate_of=getattr(args, "duplicate_of", None),
+                                 guidance=getattr(args, "guidance", None))
         except (LookupError, ValueError) as exc:
             print(exc, file=sys.stderr)
             return 1

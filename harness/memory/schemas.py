@@ -103,7 +103,6 @@ class OutTerm(Out):
 
 class VocabularyOut(Out):
     script_phrases: list[str] = []
-    description: str = ""
     terms: list[OutTerm] = []
 
 

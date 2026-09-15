@@ -36,6 +36,20 @@ class OutputTruncated(RuntimeError):
     """The model stopped at its output token limit. The response is partial and must not be used."""
 
 
+class VerificationServiceError(RuntimeError):
+    """The verification service (e.g. Wikipedia API) was unreachable; distinct from 'term not found'."""
+
+
+class ReplacementTooLarge(RuntimeError):
+    """The atomic note replacement exceeds the store's single-operation limit.
+
+    The previous reference set is left intact.
+    """
+    def __init__(self, needed: int, limit: int):
+        super().__init__(f"replacement needs {needed} operations but the store limit is {limit}")
+        self.needed, self.limit = needed, limit
+
+
 class LLM(Protocol):
     model_id: str   # part of the digest version
 
@@ -98,6 +112,18 @@ class Store(Protocol):
     def release_lock(self, project_id: str, token: str) -> None: ...
     def put_notes(self, project_id: str, notes: list[Note]) -> None: ...
     def delete_notes(self, project_id: str, note_ids: list[str]) -> None: ...
+    def replace_notes(self, project_id: str, to_delete: list[str], to_put: list[Note],
+                      expected_status: dict[str, str] | None = None) -> None:
+        """Atomically delete old notes and write new ones.
+
+        If the total operation count exceeds the store's limit, raises
+        ReplacementTooLarge without modifying anything.
+
+        expected_status maps note id -> the status the caller last saw.  If a
+        note's current status differs (e.g. it was confirmed while the run was
+        in progress), that note is silently skipped from deletion.
+        """
+        ...
 
 
 class MemoryImages:
@@ -107,6 +133,7 @@ class MemoryImages:
         self.scoped = scoped or {}      # (term, region) -> hits
         self.searched: list[str] = []
         self.queries: list[tuple[str, str | None]] = []
+        self.search_calls: list[dict] = []
 
     def verify_term(self, term):
         return self.terms.get(term.lower())
@@ -114,6 +141,12 @@ class MemoryImages:
     def search_images(self, term, limit, region=None, region_title=None):
         self.searched.append(term)
         self.queries.append((term, region))
+        self.search_calls.append({
+            "term": term,
+            "limit": limit,
+            "region": region,
+            "region_title": region_title,
+        })
         if region is None:
             return self.images.get(term.lower(), [])[:limit]
         return self.scoped.get((term.lower(), region.lower()), [])[:limit]
@@ -202,3 +235,18 @@ class MemoryStore:
     def delete_notes(self, project_id, note_ids):
         for i in note_ids:
             self.notes.pop((project_id, i), None)
+
+    def replace_notes(self, project_id, to_delete, to_put, expected_status=None):
+        total = len(to_delete) + len(to_put)
+        if total > 500:
+            raise ReplacementTooLarge(total, 500)
+        expected_status = expected_status or {}
+        for nid in to_delete:
+            existing = self.notes.get((project_id, nid))
+            if existing is not None:
+                exp = expected_status.get(nid)
+                if exp is not None and existing.status != exp:
+                    continue   # reviewed during run; skip
+                self.notes.pop((project_id, nid), None)
+        for n in to_put:
+            self.notes[(project_id, n.id)] = n.model_copy(deep=True)

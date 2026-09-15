@@ -95,16 +95,23 @@ def _get_note(store: Store, project_id: str, note_id: str) -> Note:
 
 def review_note(store: Store, project_id: str, note_id: str, decision: ReviewStatus, *,
                 reviewer: str, reason: RejectReason | None = None,
-                duplicate_of: str | None = None) -> ReviewResult:
+                duplicate_of: str | None = None,
+                guidance: str | None = None) -> ReviewResult:
     """Record a human decision about one note.
 
     The decision applies to a specific revision of (body, owner, applicability). If that
     assertion later changes, `review_is_current` goes false rather than the approval
     silently carrying over to text nobody agreed to.
+
+    guidance is restricted to confirmed reference_image notes. Omitting it
+    preserves any existing guidance. Setting it bumps the revision so the
+    confirmation applies to the resulting revision.
     """
     note = _get_note(store, project_id, note_id)
     if decision not in ("confirmed", "rejected"):
         raise ValueError("decision must be 'confirmed' or 'rejected'")
+    if guidance is not None and (decision != "confirmed" or note.kind != "reference_image"):
+        raise ValueError("guidance is only supported when confirming a reference_image note")
     if duplicate_of is not None:
         if decision != "rejected":
             raise ValueError("only a rejected note can be a duplicate of another")
@@ -116,9 +123,17 @@ def review_note(store: Store, project_id: str, note_id: str, decision: ReviewSta
         raise ValueError("rejecting a note needs a reason: false, wrong_scope, duplicate, "
                          "not_useful, other")
 
-    updated = note.touch(status=decision, reviewed_revision=note.revision, reviewed_by=reviewer,
-                         reviewed_at=utcnow(), review_reason=reason if decision == "rejected" else None,
+    changes: dict = dict(status=decision, reviewed_by=reviewer,
+                         reviewed_at=utcnow(),
+                         review_reason=reason if decision == "rejected" else None,
                          duplicate_of=duplicate_of)
+    # guidance edit: bump revision so the confirmation applies to the new state
+    if guidance is not None:
+        changes["guidance"] = guidance
+        changes["revision"] = note.revision + 1
+    changes["reviewed_revision"] = changes.get("revision", note.revision)
+
+    updated = note.touch(**changes)
     store.put_notes(project_id, [updated])
     return ReviewResult(note=updated, action=decision)
 
