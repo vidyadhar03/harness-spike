@@ -17,10 +17,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "reportlab>=4"]
+dev = ["pytest>=8", "reportlab>=4", "httpx>=0.27"]
+api = ["fastapi>=0.115", "uvicorn[standard]>=0.30"]
 
 [project.scripts]
 harness-memory = "harness.memory.cli:main"
+harness-api = "harness.api.main:run"
 
 [tool.setuptools.packages.find]
 include = ["harness*"]

@@ -7,6 +7,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pypdfium2 as pdfium
+from PIL import Image as _PILImage, UnidentifiedImageError as _UnidentifiedImageError
 
 from .models import SourceKind
 
@@ -14,6 +15,15 @@ PDF = "application/pdf"
 IMAGE_MIME = {"image/png", "image/jpeg", "image/webp", "image/heic", "image/heif"}
 TEXT_MIME = {"text/markdown", "text/plain"}
 SUPPORTED_MIME = {PDF} | IMAGE_MIME | TEXT_MIME
+
+# Accepted formats for user-uploaded location reference images.
+# Excludes HEIC/HEIF: inconsistent browser read support and non-universal
+# Pillow decode (requires libheif). The pipeline fetches HEIC from external
+# sources but the upload path enforces a stricter known-good set.
+ACCEPTED_REFERENCE_MIMES: frozenset[str] = frozenset({"image/jpeg", "image/png", "image/webp"})
+# 4000x4000 = 16 MP cap. Enforced from header dimensions BEFORE any pixel decode so
+# an attacker cannot force a multi-gigabyte decompression with a small upload.
+MAX_REFERENCE_PIXELS: int = 4_000 * 4_000
 _HEIF_BRANDS = {b"heic", b"heix", b"hevc", b"heim", b"heis", b"mif1", b"msf1"}
 
 
@@ -126,3 +136,55 @@ def text_chunks(text: str, max_chars: int) -> list[str]:
     if current:
         chunks.append("\n\n".join(current))
     return [c for c in chunks if c.strip()]
+
+# --- user-uploaded reference image validation ---------------------------------
+
+def validate_reference_image(data: bytes, mime: str) -> tuple[int, int]:
+    """Decode-validate image bytes for user-uploaded location references.
+
+    Returns (width, height) in pixels. Raises ValueError for:
+    - MIME not in ACCEPTED_REFERENCE_MIMES
+    - Corrupt or truncated data (Pillow OSError / UnidentifiedImageError)
+    - Pixel count > MAX_REFERENCE_PIXELS (checked from header BEFORE decode)
+    - Animated images (APNG, animated WebP)
+    - Decoder format inconsistent with the sniffed MIME
+
+    The streamed byte-count limit is enforced upstream by _read_body_bounded;
+    this function validates content, not body size.
+    """
+    if mime not in ACCEPTED_REFERENCE_MIMES:
+        raise ValueError(
+            f"unsupported image format {mime!r}; accepted: jpeg, png, webp"
+        )
+    try:
+        with _PILImage.open(io.BytesIO(data)) as img:
+            # 1. Dimensions from header metadata - no pixel decode yet.
+            w, h = img.size
+            # 2. Pixel-count guard BEFORE any full decode operation.
+            if w * h > MAX_REFERENCE_PIXELS:
+                raise ValueError(
+                    f"image too large ({w}\u00d7{h} = {w*h:,} px); "
+                    f"limit is {MAX_REFERENCE_PIXELS:,} px total"
+                )
+            # 3. Reject animated images (APNG, animated WebP).
+            if getattr(img, "n_frames", 1) > 1:
+                raise ValueError("animated images are not supported")
+            # 4. Force full pixel decode within known-safe bounds.
+            #    Catches truncated bodies, decompression bombs (PIL raises
+            #    DecompressionBombError at its own 178 MP limit, well above ours),
+            #    and corrupt trailing data.
+            img.load()
+            # 5. Cross-check what Pillow actually decoded against sniffed MIME.
+            _FMT_TO_MIME = {
+                "JPEG": "image/jpeg",
+                "PNG": "image/png",
+                "WEBP": "image/webp",
+            }
+            decoded_mime = _FMT_TO_MIME.get(img.format or "")
+            if decoded_mime != mime:
+                raise ValueError(
+                    f"declared {mime!r} but image decoded as {img.format!r}"
+                )
+    except (_UnidentifiedImageError, _PILImage.DecompressionBombError, OSError) as exc:
+        raise ValueError(f"invalid image data: {exc}") from exc
+    return w, h

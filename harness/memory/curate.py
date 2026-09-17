@@ -96,7 +96,9 @@ def _get_note(store: Store, project_id: str, note_id: str) -> Note:
 def review_note(store: Store, project_id: str, note_id: str, decision: ReviewStatus, *,
                 reviewer: str, reason: RejectReason | None = None,
                 duplicate_of: str | None = None,
-                guidance: str | None = None) -> ReviewResult:
+                guidance: str | None = None,
+                expected_revision: int | None = None,
+                expected_status: ReviewStatus | None = None) -> ReviewResult:
     """Record a human decision about one note.
 
     The decision applies to a specific revision of (body, owner, applicability). If that
@@ -106,6 +108,13 @@ def review_note(store: Store, project_id: str, note_id: str, decision: ReviewSta
     guidance is restricted to confirmed reference_image notes. Omitting it
     preserves any existing guidance. Setting it bumps the revision so the
     confirmation applies to the resulting revision.
+
+    expected_revision and expected_status, when both given, make the write conditional on
+    the note still being at that (revision, status) - raises NoteReviewConflict otherwise.
+    Covers two browser tabs reviewing the same note, and a pipeline re-run replacing it
+    underneath a pending review. Both are required together (a status-only or
+    revision-only check would not actually protect the case it looks like it protects -
+    see NoteReviewConflict). The CLI leaves both unset and keeps its unconditional behavior.
     """
     note = _get_note(store, project_id, note_id)
     if decision not in ("confirmed", "rejected"):
@@ -133,8 +142,14 @@ def review_note(store: Store, project_id: str, note_id: str, decision: ReviewSta
         changes["revision"] = note.revision + 1
     changes["reviewed_revision"] = changes.get("revision", note.revision)
 
+    if (expected_revision is None) != (expected_status is None):
+        raise ValueError("expected_revision and expected_status must be given together")
+
     updated = note.touch(**changes)
-    store.put_notes(project_id, [updated])
+    if expected_revision is not None:
+        store.put_note_if_current(project_id, updated, expected_revision, expected_status)
+    else:
+        store.put_notes(project_id, [updated])
     return ReviewResult(note=updated, action=decision)
 
 

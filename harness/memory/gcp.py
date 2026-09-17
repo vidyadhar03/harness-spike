@@ -8,7 +8,7 @@ from pydantic import TypeAdapter
 
 from .config import Settings
 from .models import Entity, Note, Project, Source
-from .ports import Blob, EntityDoc, OutputTruncated, ReplacementTooLarge, Part, T, Text, Uri
+from .ports import Blob, EntityDoc, NoteReviewConflict, OutputTruncated, ReplacementTooLarge, Part, T, Text, Uri
 from .schemas import gemini_schema, parse_json
 
 log = logging.getLogger(__name__)
@@ -53,12 +53,85 @@ class FirestoreStore:
     def put_project(self, project):
         self._project(project.id).set(project.model_dump())
 
+    def list_projects(self):
+        return [Project.model_validate(d.to_dict()) for d in self._db.collection("projects").stream()]
+
     def get_source(self, project_id, source_id):
         snap = self._col(project_id, "sources").document(source_id).get()
         return Source.model_validate(snap.to_dict()) if snap.exists else None
 
     def put_source(self, project_id, source):
         self._col(project_id, "sources").document(source.id).set(source.model_dump())
+
+    def put_source_if_absent(self, project_id, source):
+        """Atomic create-if-absent for sources. Uses a Firestore transaction so two
+        concurrent writers (e.g. register_file and _store_image for the same sha256)
+        cannot both succeed and clobber each other's purpose/status/provenance.
+        """
+        from .models import Source as _Source
+        ref = self._col(project_id, "sources").document(source.id)
+        transaction = self._db.transaction()
+
+        @firestore_transactional(self._db)
+        def _create(tx):
+            snap = ref.get(transaction=tx)
+            if snap.exists:
+                return _Source.model_validate(snap.to_dict()), False
+            tx.set(ref, source.model_dump())
+            return source, True
+
+        return _create(transaction)
+
+    def promote_source_to_ingest(self, project_id, source_id):
+        """Atomically promote a reference-only source to dual 'both' purpose.
+
+        Reads the source inside the transaction and returns it unchanged if already
+        ingest-eligible - a delayed second promotion after ingestion started must not
+        reset the source's processing state. Raises KeyError when not found.
+        """
+        from .models import Source as _Source, utcnow
+        ref = self._col(project_id, "sources").document(source_id)
+        transaction = self._db.transaction()
+
+        @firestore_transactional(self._db)
+        def _promote(tx):
+            snap = ref.get(transaction=tx)
+            if not snap.exists:
+                raise KeyError(source_id)
+            src = _Source.model_validate(snap.to_dict())
+            if src.is_ingest_eligible:
+                # Already ingest-eligible (ingest or both): preserve current state.
+                return src
+            # Transition from reference-only: mark as both and reset ingestion state
+            # so ingest_source does not skip it as already-digested.
+            updated = src.touch(
+                source_purpose="both",
+                status="uploaded",
+                digest_version=None,
+            )
+            tx.set(ref, updated.model_dump())
+            return updated
+
+        return _promote(transaction)
+
+    def put_note_if_absent(self, project_id, note):
+        """Atomic create-if-absent for notes. Follows the same transactional pattern as
+        put_note_if_current so concurrent uploads to the same location do not overwrite
+        a reviewed note written between their reads.
+        """
+        from .models import Note as _Note
+        ref = self._col(project_id, "notes").document(note.id)
+        transaction = self._db.transaction()
+
+        @firestore_transactional(self._db)
+        def _create(tx):
+            snap = ref.get(transaction=tx)
+            if snap.exists:
+                return _Note.model_validate(snap.to_dict()), False
+            tx.set(ref, note.model_dump())
+            return note, True
+
+        return _create(transaction)
 
     def list_sources(self, project_id):
         return [Source.model_validate(d.to_dict()) for d in self._col(project_id, "sources").stream()]
@@ -138,8 +211,61 @@ class FirestoreStore:
         if snap.exists and snap.to_dict().get("token") == token:
             ref.delete()
 
+    def renew_lock(self, project_id, token):
+        """Refreshes taken_at so a genuinely still-running holder isn't mistaken for an
+        abandoned one and reclaimed mid-run by acquire_lock's staleness check - see
+        ingest.py's per-source renewal calls in its drop/ingest loops."""
+        from .models import utcnow
+
+        ref = self._project(project_id).collection("locks").document("ingest")
+        transaction = self._db.transaction()
+
+        @firestore_transactional(self._db)
+        def _renew(tx):
+            snap = ref.get(transaction=tx)
+            if not snap.exists or snap.to_dict().get("token") != token:
+                return False
+            tx.update(ref, {"taken_at": utcnow()})
+            return True
+
+        return _renew(transaction)
+
     def put_notes(self, project_id, notes):
         self._write(project_id, "notes", [(n.id, n.model_dump()) for n in notes])
+
+    def put_note_if_current(self, project_id, note, expected_revision, expected_status):
+        """Transactional compare-and-swap on (revision, status).
+
+        Guards the two-browser-tabs case: both read the same (revision, status), both
+        try to write; the loser's transaction sees the note has moved on and aborts with
+        NoteReviewConflict rather than silently clobbering the winner's decision. Status
+        is checked alongside revision because a plain confirm/reject with no guidance
+        edit never changes revision - see NoteReviewConflict's docstring.
+
+        NOT exercised against real or emulated Firestore by this project's automated
+        tests (tests/test_api.py and tests/test_curate.py drive this behavior only
+        through MemoryStore.put_note_if_current, an in-process dict equivalent). The
+        transaction shape (read-check-write, raising inside the transactional function
+        to abort without committing) matches acquire_lock above, the one Firestore
+        transaction in this file that predates this method, but that is a design
+        precedent, not a verification of this method itself. Run against
+        FIRESTORE_EMULATOR_HOST at least once before depending on this in anything
+        beyond local/manual use.
+        """
+        ref = self._col(project_id, "notes").document(note.id)
+        transaction = self._db.transaction()
+
+        @firestore_transactional(self._db)
+        def _swap(tx):
+            snap = ref.get(transaction=tx)
+            data = snap.to_dict() if snap.exists else {}
+            current_rev = data.get("revision") if snap.exists else None
+            current_status = data.get("status") if snap.exists else None
+            if current_rev != expected_revision or current_status != expected_status:
+                raise NoteReviewConflict(note.id, expected_revision, current_rev, expected_status, current_status)
+            tx.set(ref, note.model_dump())
+
+        _swap(transaction)
 
     def delete_notes(self, project_id, note_ids):
         self._write(project_id, "notes", [(i, None) for i in note_ids])

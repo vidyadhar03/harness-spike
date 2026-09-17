@@ -1,2 +1,3 @@
 [console_scripts]
+harness-api = harness.api.main:run
 harness-memory = harness.memory.cli:main

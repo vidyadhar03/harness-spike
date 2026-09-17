@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import Settings
-from .files import extension_for
+from .files import ACCEPTED_REFERENCE_MIMES, extension_for, kind_for, sniff_mime, validate_reference_image
 from .ingest import PROMPTS, load_prompt, source_uri
 from .models import Location, Note, NoteOrigin, Provenance, RetrievalOrigin, Source
 from .ports import (
@@ -517,17 +517,19 @@ def _store_image(ctx: RefCtx, project_id: str, hit: ImageHit,
         log.warning("could not fetch %s: %s", hit.preview_url, exc)
         return None
     sid = hashlib.sha256(data).hexdigest()
-    existing = ctx.store.get_source(project_id, sid)
-    if existing is not None:
-        return existing
     name = Path(hit.title).name or "reference"
     uri = source_uri(ctx.settings, project_id, sid, "original" + extension_for(name, hit.mime_type))
     ctx.blobs.put(uri, data, hit.mime_type)
     src = Source(id=sid, filename=name, mime_type=hit.mime_type, kind="image", doc_type="reference",
                  size_bytes=len(data), storage_path=uri, status="digested",
+                 source_purpose="reference",
                  origin_url=hit.page_url or hit.image_url, license=hit.license, attribution=hit.attribution)
-    ctx.store.put_source(project_id, src)
-    return src
+    # put_source_if_absent: if the same bytes were already stored (e.g. as an ingest-purpose
+    # source or a user-uploaded reference), keep that record's purpose/status/provenance.
+    # The blob write above is idempotent (content-addressed key). Return whichever record
+    # exists so note provenance always points at the canonical stored Source.
+    stored, _ = ctx.store.put_source_if_absent(project_id, src)
+    return stored
 
 
 def _vocabulary_note(scope_id: str, version: str, vocab: VocabularyOut,
@@ -801,3 +803,95 @@ a:hover {{ text-decoration: underline; }}
     html_path = out_dir / f"{re.sub(r'[^a-z0-9]+', '-', entity.name.lower()).strip('-')}-references.html"
     html_path.write_text("".join(parts), encoding="utf-8")
     return html_path, len(ref_notes), hint
+
+# --- user-uploaded location reference images ----------------------------------
+
+def _attachment_note_id(location_id: str, source_id: str) -> str:
+    """Deterministic note ID for a (location, source) attachment pair.
+
+    Stable across processes and restarts. The same image bytes attached to the same
+    location always produces the same ID, which allows put_note_if_absent to be
+    idempotent and makes concurrent duplicate uploads safe.
+
+    Different locations produce different IDs, so two locations that reference the
+    same underlying image retain fully independent review state.
+    """
+    digest = hashlib.sha256(f"user-ref\x00{location_id}\x00{source_id}".encode()).hexdigest()
+    return f"note_{digest[:12]}"
+
+
+def upload_reference_image(
+    store: Store,
+    blobs: Blobs,
+    settings: Settings,
+    project_id: str,
+    location_id: str,
+    data: bytes,
+    filename: str,
+) -> tuple[Note, bool]:
+    """Attach a user-uploaded image as a location reference note.
+
+    Returns (note, created) where created=True means a new attachment note was written
+    for this location. created=False means the same image was already attached to this
+    location; the existing note (with its current status/revision/guidance) is returned
+    unchanged.
+
+    Does NOT call any LLM. No caption, direction, attribution, or licensing is
+    fabricated. Body is set to the filename as the visible provenance label.
+
+    Cross-purpose behavior:
+    - If the same bytes are already stored as an ingest-purpose source, the existing
+      source is used as-is. It remains ingest-eligible and appears in GET /sources.
+    - If bytes are new, a reference-purpose source is created.
+    - Source purpose is never changed by this function.
+
+    Image validation (ValueError -> HTTP 400):
+    - MIME must be in ACCEPTED_REFERENCE_MIMES (jpeg, png, webp).
+    - Pillow must fully decode the image within MAX_REFERENCE_PIXELS.
+    - Animated images are rejected.
+    - Byte-count limit is enforced upstream by the route's _read_body_bounded.
+    """
+    from .ingest import source_uri   # local import to avoid circular at module load
+
+    mime = sniff_mime(data, filename)
+    validate_reference_image(data, mime)   # raises ValueError on bad content
+
+    sid = hashlib.sha256(data).hexdigest()
+    uri = source_uri(settings, project_id, sid, "original" + extension_for(filename, mime))
+    blobs.put(uri, data, mime)
+
+    ref_src = Source(
+        id=sid, filename=filename, mime_type=mime,
+        kind=kind_for(mime), doc_type="reference",
+        size_bytes=len(data), storage_path=uri,
+        status="digested",          # reference images don't go through ingest_source
+        source_purpose="reference",
+        origin_url=None,            # user-uploaded: no external origin
+        license=None, attribution=None,
+    )
+    # Use the existing source record if the same bytes are already stored; never
+    # overwrite an ingest-purpose source's purpose or provenance.
+    stored_src, _ = store.put_source_if_absent(project_id, ref_src)
+
+    note_id = _attachment_note_id(location_id, sid)
+    new_note = Note(
+        id=note_id,
+        kind="reference_image",
+        owner_id=location_id,
+        author="user",
+        body=filename,          # visible provenance label; not an AI-generated caption
+        provenance=[Provenance(source_id=stored_src.id)],
+        origin=NoteOrigin(
+            producer="user",
+            scope=location_id,
+            digest_version="user-upload-v1",
+        ),
+        # group, direction left None: the pipeline may later assign a direction when the
+        # image is included in a generated run; this upload alone does not imply approval
+        # of any visual concept.
+    )
+    # Atomic create-if-absent: if the note already exists (reviewed, guided, or from a
+    # concurrent upload), return it unchanged without any write. This is the only safe
+    # path - put_notes would silently overwrite a reviewed note.
+    note, created = store.put_note_if_absent(project_id, new_note)
+    return note, created

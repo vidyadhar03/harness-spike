@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +36,72 @@ PROMPTS = Path(__file__).parent / "prompts"
 
 
 LOCK_STALE_AFTER_S = 3600
+# Renewing this often within the staleness window leaves comfortable margin for a
+# missed or delayed renewal (a slow Firestore round-trip, a busy event loop) without
+# the lock actually going stale. Not "once between sources" - see LockRenewer.
+LOCK_RENEW_INTERVAL_S = LOCK_STALE_AFTER_S // 4
+
+
+class LockRenewer:
+    """Background heartbeat that keeps an acquired ingest_lock token alive for exactly
+    as long as work continues under it - independent of what phase that work is in.
+
+    Renewing only between units of work (e.g. once per source in a batch) leaves two
+    periods unprotected: waiting for a concurrency slot before any work has started,
+    and a single unit of work that itself runs long (a large script with many chunked
+    extraction passes). Running on a fixed timer, on its own thread, covers both -
+    it renews on schedule regardless of whether the caller is queued, between sources,
+    or mid-source.
+
+    Shared by the CLI (cli.py's drop/ingest loops) and the API (JobRunner._run_ingest,
+    via asyncio.to_thread for start/stop so neither blocks the event loop) - one
+    implementation, not two independently-maintained ones. threading.Event.is_set() is
+    safe to poll from either a plain thread or asyncio code.
+
+    Ownership loss (renew_lock returns False - someone else now holds the lock, almost
+    certainly because a delay let it go stale) sets `lost` and stops renewing; it does
+    NOT and cannot interrupt whatever unit of work is currently in flight (the same
+    limitation as running ingestion/references jobs with no execution timeout: a thread
+    doing real work cannot be force-cancelled). What it does guarantee is that no
+    *further* unit of work is allowed to start once `lost` is set - callers must check
+    `lost.is_set()` before beginning each next source and stop instead of silently
+    continuing without exclusive ownership. This does not eliminate every race (a single
+    unit of work that itself outlasts the full staleness window before renewal ever gets
+    a chance to run is not caught here either), but it shrinks the exposed window from
+    "an entire multi-source batch" to "at most one unit of work," and stops the run
+    outright rather than letting it continue unbounded without the lock.
+    """
+
+    def __init__(self, store: Store, project_id: str, token: str, *,
+                interval_s: float = LOCK_RENEW_INTERVAL_S):
+        self._store, self._project_id, self._token, self._interval_s = store, project_id, token, interval_s
+        self.lost = threading.Event()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name=f"lock-renewer-{project_id}")
+
+    def start(self) -> "LockRenewer":
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        # _stop.wait(interval) returns True (and we exit immediately) the moment stop()
+        # is called, rather than only after a full interval - so stop() doesn't have to
+        # wait out whatever's left of the current cycle.
+        while not self._stop.wait(self._interval_s):
+            if not self._store.renew_lock(self._project_id, self._token):
+                log.error("ingest lock for project %s was lost (renewal failed) - no "
+                         "further source should start without exclusive ownership",
+                         self._project_id)
+                self.lost.set()
+                return
+
+    def stop(self) -> None:
+        """Idempotent; safe to call even if the thread never started or already exited
+        on its own (lost ownership). Always call this when the owner is done - success,
+        failure, or an early abort - so a finished run never keeps renewing forever."""
+        self._stop.set()
+        self._thread.join(timeout=5)  # bounded, not interval_s-scaled - see _run's comment
 
 
 @dataclass
@@ -100,15 +167,27 @@ def register_file(ctx: Ctx, project_id: str, data: bytes, filename: str, *,
     `document_id` identifies the logical document across drafts. Superseding an earlier
     source marks it, so retrieval can warn that some notes come from an old draft; it
     does NOT transfer any confirmation, which is a human reconciliation.
+
+    Cross-purpose deduplication:
+    - If a source with this hash already exists and is already ingest-eligible, it is
+      returned as-is (created=False). Bytes and provenance are unchanged.
+    - If a source exists as reference-only (uploaded via upload_reference_image), it is
+      atomically promoted to 'both' purpose: ingest-eligible and visible in GET /sources.
+      Status is reset inside promote_source_to_ingest so ingest_source does not skip it.
+      created=False in both cases; the bytes are not new.
+    - Blob write uses the existing storage_path; no object is overwritten.
+    - Uses put_source_if_absent for initial creation: two concurrent calls for the same
+      hash cannot both succeed and clobber each other's purpose or provenance.
     """
     sid = hashlib.sha256(data).hexdigest()
-    existing = ctx.store.get_source(project_id, sid)
-    if existing is not None:
-        return existing, False
     mime = sniff_mime(data, filename)
     supported = mime in SUPPORTED_MIME
     uri = source_uri(ctx.settings, project_id, sid, "original" + extension_for(filename, mime))
-    ctx.blobs.put(uri, data, mime)  # bytes first, so a Source never points at a missing object
+    # Blob write is idempotent: the key is content-addressed, so writing identical bytes
+    # with a later filename is a no-op at the object level. The winning Source's
+    # storage_path is the canonical URI; the blob is never overwritten with a different
+    # MIME or filename from a later caller - the first successful put wins.
+    ctx.blobs.put(uri, data, mime)
     prior = ctx.store.get_source(project_id, supersedes) if supersedes else None
     if supersedes and prior is None:
         raise KeyError(f"cannot supersede unknown source {supersedes}")
@@ -116,13 +195,19 @@ def register_file(ctx: Ctx, project_id: str, data: bytes, filename: str, *,
         id=sid, filename=filename, mime_type=mime, kind=kind_for(mime), size_bytes=len(data),
         storage_path=uri, status="uploaded" if supported else "unsupported",
         error=None if supported else f"no v0 handler for {mime}",
+        source_purpose="ingest",
         document_id=document_id or (prior.document_id if prior else None),
         revision_label=revision_label, supersedes_source_id=supersedes,
     )
-    ctx.store.put_source(project_id, src)
+    stored, created = ctx.store.put_source_if_absent(project_id, src)
+    if not created:
+        # Existing source found. Promote to ingest-eligible if it was reference-only;
+        # no-op (returns existing) if it is already ingest-eligible.
+        stored = ctx.store.promote_source_to_ingest(project_id, sid)
+        return stored, False
     if prior is not None:
         ctx.store.put_source(project_id, prior.touch(superseded_by_source_id=sid))
-    return src, True
+    return stored, True
 
 
 # --- worker ---------------------------------------------------------------------
@@ -147,6 +232,13 @@ def ingest_source(ctx: Ctx, project_id: str, source_id: str, *, force: bool = Fa
     report = IngestReport(source_id=src.id, filename=src.filename, status=src.status, doc_type=src.doc_type)
     version = digest_version(ctx.llm)
 
+    if not src.is_ingest_eligible:
+        # Reference-only source: skipped, not failed. The source is correctly stored
+        # for reference provenance; it was simply passed to the wrong path. The CLI
+        # and the API both guard before reaching here, so this is a belt-and-suspenders
+        # stop for any future caller that forgets.
+        report.status = "skipped"
+        return report
     if src.status == "unsupported":
         return report
     if not force and src.status == "digested" and src.digest_version == version:

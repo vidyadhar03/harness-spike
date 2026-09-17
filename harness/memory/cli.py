@@ -26,30 +26,12 @@ from collections import Counter
 from pathlib import Path
 
 from .config import Settings
-from .ingest import Ctx, IngestReport, ingest_lock, ingest_source, register_file
+from .factory import build_ctx, build_ref_ctx, build_store
+from .ingest import IngestReport, LockRenewer, ingest_lock, ingest_source, register_file
 from .models import Location, Project, Scene
 from .curate import merge_entities, review_containment, review_note
-from .references import RefCtx, ReferenceReport, export_references_html, suggest_references
+from .references import ReferenceReport, export_references_html, suggest_references
 from .retrieval import export_context, get_context, render_context_md, render_index_md
-
-
-def build_store(s: Settings):
-    from .gcp import FirestoreStore
-
-    return FirestoreStore(s.gcp_project, s.firestore_database)
-
-
-def build_ctx(s: Settings) -> Ctx:
-    from .gcp import GCSBlobs, GeminiLLM
-
-    return Ctx(build_store(s), GCSBlobs(s.gcp_project), GeminiLLM(s), s)
-
-
-def build_ref_ctx(s: Settings) -> RefCtx:
-    from .gcp import GCSBlobs, GeminiLLM
-    from .wikimedia import WikimediaImages
-
-    return RefCtx(build_store(s), GCSBlobs(s.gcp_project), GeminiLLM(s), WikimediaImages(), s)
 
 
 def iter_files(paths: list[str]):
@@ -384,18 +366,47 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{'new' if created else 'known':<5} {src.status:<11} {name}")
             ids.append(src.id)
         if not args.no_ingest:
-            with ingest_lock(ctx, args.project_id):
-                for sid in dict.fromkeys(ids):
-                    print_report(ingest_source(ctx, args.project_id, sid))
+            with ingest_lock(ctx, args.project_id) as token:
+                # keeps the lock alive on a fixed timer for as long as this batch runs -
+                # covers a single long source too, not just the gaps between sources
+                # (see LockRenewer's docstring)
+                renewer = LockRenewer(ctx.store, args.project_id, token).start()
+                try:
+                    for sid in dict.fromkeys(ids):
+                        if renewer.lost.is_set():
+                            print(f"lost the ingest lock for {args.project_id}; stopping "
+                                 "before any further source", file=sys.stderr)
+                            break
+                        print_report(ingest_source(ctx, args.project_id, sid))
+                finally:
+                    renewer.stop()
         return 0
 
     if args.cmd == "ingest":
-        sources = ([ctx.store.get_source(args.project_id, args.source)] if args.source
-                   else ctx.store.list_sources(args.project_id))
-        with ingest_lock(ctx, args.project_id):
-            for src in sources:
-                if src is not None:
+        if args.source:
+            src = ctx.store.get_source(args.project_id, args.source)
+            if src is None:
+                print(f"source {args.source} not found in project {args.project_id}", file=sys.stderr)
+                return 1
+            if not src.is_ingest_eligible:
+                print(f"source {args.source} is stored as a reference image and cannot be ingested", file=sys.stderr)
+                return 1
+            sources = [src]
+        else:
+            sources = [s for s in ctx.store.list_sources(args.project_id) if s.is_ingest_eligible]
+        with ingest_lock(ctx, args.project_id) as token:
+            renewer = LockRenewer(ctx.store, args.project_id, token).start()
+            try:
+                for src in sources:
+                    if src is None:
+                        continue
+                    if renewer.lost.is_set():
+                        print(f"lost the ingest lock for {args.project_id}; stopping "
+                             "before any further source", file=sys.stderr)
+                        break
                     print_report(ingest_source(ctx, args.project_id, src.id, force=args.force))
+            finally:
+                renewer.stop()
         return 0
 
     if args.cmd == "status":

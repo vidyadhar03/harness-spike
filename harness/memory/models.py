@@ -112,6 +112,18 @@ class Source(Doc):
     license: str | None = None          # e.g. "CC BY-SA 4.0"; required for fetched images
     attribution: str | None = None      # author/credit line to reproduce with the image
 
+    # Explicit upload intent.  None means "legacy record" - use effective_purpose below.
+    # "ingest"    : uploaded for screenplay/notes ingestion; appears in GET /sources.
+    # "reference" : stored only for visual reference; excluded from ingestion paths.
+    # "both"      : was reference-only, then explicitly promoted via POST /sources.
+    #
+    # IMPORTANT: source_purpose alone does NOT tell you whether a source has location
+    # reference note attachments - that association lives entirely in Note.owner_id.
+    # An "ingest"-purpose source can have reference notes; a "both"-purpose source has
+    # reference notes AND is eligible for ingestion. Do not infer reference usage from
+    # this field; query notes_for_owners instead.
+    source_purpose: Literal["ingest", "reference", "both"] | None = None
+
     @field_validator("storage_path")
     @classmethod
     def _no_signed_urls(cls, v: str) -> str:
@@ -122,6 +134,30 @@ class Source(Doc):
     @property
     def superseded(self) -> bool:
         return self.superseded_by_source_id is not None
+
+    @property
+    def effective_purpose(self) -> Literal["ingest", "reference", "both"]:
+        """Backward-compatible purpose resolution.
+
+        Honors an explicit source_purpose when set. For legacy records written
+        before this field existed, retains the origin_url-based distinction:
+        - Wikimedia-fetched images always have origin_url set  -> 'reference'
+        - Screenplay/notes uploads via register_file never do  -> 'ingest'
+        No bulk migration required; existing persisted documents continue to work.
+        """
+        if self.source_purpose is not None:
+            return self.source_purpose
+        return "reference" if self.origin_url is not None else "ingest"
+
+    @property
+    def is_ingest_eligible(self) -> bool:
+        """Single authoritative check used by all five ingestion paths.
+
+        True for 'ingest' and 'both'; False for 'reference'. Callers must use
+        this property, not compare effective_purpose strings directly, so the
+        set of eligible values stays consistent if new purpose values are added.
+        """
+        return self.effective_purpose in ("ingest", "both")
 
 
 # --- Entities: what notes are about --------------------------------------------

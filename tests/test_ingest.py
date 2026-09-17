@@ -1,5 +1,6 @@
 import io
 import json
+import time
 
 import pytest
 from PIL import Image
@@ -7,7 +8,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 
 from harness.memory.config import Settings
-from harness.memory.ingest import Ctx, digest_version, ingest_source, register_file
+from harness.memory.ingest import Ctx, LockRenewer, digest_version, ingest_source, register_file
 from harness.memory.models import PROJECT_SCOPE, Applicability, Location, Project, Scene
 from harness.memory.ports import Blob, MemoryBlobs, MemoryStore, OutputTruncated, Text
 from harness.memory.schemas import (
@@ -446,3 +447,56 @@ def test_a_named_owner_beats_the_project_wide_flag():
     lenses = notes["Longer lenses throughout."]
     assert lenses.owner_id == PROJECT_SCOPE
     assert not lenses.applicability.include_descendants      # project notes apply everywhere already
+
+
+# --- LockRenewer: the shared periodic-renewal primitive behind both the CLI's
+# drop/ingest loops and the API's JobRunner._run_ingest -------------------------------
+
+def test_lock_renewer_keeps_a_held_lock_alive_on_a_fixed_schedule():
+    store = MemoryStore()
+    pid = "prj_renewer_test"
+    token = store.acquire_lock(pid, "holder", stale_after_s=0.15)
+    assert token is not None
+
+    renewer = LockRenewer(store, pid, token, interval_s=0.03).start()
+    try:
+        time.sleep(0.3)  # 2x the staleness window, renewed ~10 times at 0.03s
+        assert store.acquire_lock(pid, "competitor", 0.15) is None  # still held
+        assert not renewer.lost.is_set()
+    finally:
+        renewer.stop()
+    store.release_lock(pid, token)
+
+
+def test_lock_renewer_detects_and_reports_lost_ownership():
+    store = MemoryStore()
+    pid = "prj_renewer_test2"
+    token = store.acquire_lock(pid, "holder", stale_after_s=0.15)
+    assert token is not None
+
+    renewer = LockRenewer(store, pid, token, interval_s=0.03).start()
+    try:
+        store.release_lock(pid, token)
+        thief_token = store.acquire_lock(pid, "thief", 0.15)
+        assert thief_token is not None
+
+        assert renewer.lost.wait(timeout=1), "renewer never noticed the stolen lock"
+        # the thief's own lock is untouched - the renewer only ever tries its own token
+        assert store.acquire_lock(pid, "someone-else", 0.15) is None
+        store.release_lock(pid, thief_token)
+    finally:
+        renewer.stop()  # idempotent even though the renewer already stopped itself
+
+
+def test_lock_renewer_stop_is_prompt_and_idempotent():
+    store = MemoryStore()
+    pid = "prj_renewer_test3"
+    token = store.acquire_lock(pid, "holder", stale_after_s=60)
+    assert token is not None
+
+    renewer = LockRenewer(store, pid, token, interval_s=60).start()  # would not tick for 60s
+    t0 = time.monotonic()
+    renewer.stop()
+    assert time.monotonic() - t0 < 1, "stop() should not wait out the renewal interval"
+    renewer.stop()  # idempotent - must not raise or hang
+    store.release_lock(pid, token)

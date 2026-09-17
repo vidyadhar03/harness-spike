@@ -6,6 +6,11 @@ pypdfium2>=4.30
 pillow>=10
 json-repair>=0.30
 
+[api]
+fastapi>=0.115
+uvicorn[standard]>=0.30
+
 [dev]
 pytest>=8
 reportlab>=4
+httpx>=0.27
