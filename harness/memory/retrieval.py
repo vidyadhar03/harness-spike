@@ -27,6 +27,13 @@ _KIND_ORDER = {"constraint": 0, "description": 1, "tone": 2, "vocabulary": 3, "r
 _SECTIONS = [("constraint", "Constraints"), ("description", "Description"), ("tone", "Tone"),
              ("vocabulary", "Search vocabulary")]
 
+# The note kinds that make up a location/scene "brief" - excludes reference_image
+# (its own review flow) and vocabulary (pipeline-internal search terms). Shared with
+# concepts.py (approval snapshot sectioning) and curate.py (correction/split scope) so
+# both stay in sync with exactly what render_context_md's own _SECTIONS treats as
+# brief content, without either redefining the set.
+BRIEF_NOTE_KINDS = ("description", "constraint", "tone")
+
 
 # --- resolution -----------------------------------------------------------------
 

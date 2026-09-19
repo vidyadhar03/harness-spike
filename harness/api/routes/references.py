@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from starlette.concurrency import run_in_threadpool
 
 from harness.memory.config import Settings
-from harness.memory.curate import review_note
+from harness.memory.curate import NoteSuccessorSpec, correct_note, review_note
 from harness.memory.models import Location, Project
 from harness.memory.ports import Blobs, NoteReviewConflict, Store
 from harness.memory.references import upload_reference_image
@@ -12,8 +12,11 @@ from harness.memory.retrieval import _Graph, resolve_scope
 
 from ..deps import (existing_project, get_api_settings, get_blobs, get_settings,
                     get_store, require_allowed_origin, require_json)
-from ..dto import ReferenceListOut, ReferenceUploadOut, ReviewRequest, ReviewResultOut
-from ..mapping import reference_list
+from ..dto import (
+    CorrectNoteRequest, NoteCorrectionResultOut, ReferenceListOut, ReferenceUploadOut,
+    ReviewRequest, ReviewResultOut,
+)
+from ..mapping import note_correction_result_out, reference_list
 from ..settings import ApiSettings
 
 router = APIRouter(tags=["references"])
@@ -60,7 +63,43 @@ async def review(project_id: str, note_id: str, body: ReviewRequest, store: Stor
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     n = result.note
     return ReviewResultOut(id=n.id, status=n.status, revision=n.revision,
-                           reviewed_by=n.reviewed_by, reviewed_at=n.reviewed_at, guidance=n.guidance)
+                           reviewed_by=n.reviewed_by, reviewed_at=n.reviewed_at, guidance=n.guidance,
+                           review_reason=n.review_reason)
+
+
+@router.post("/projects/{project_id}/notes/{note_id}/correct", response_model=NoteCorrectionResultOut,
+            dependencies=[Depends(require_allowed_origin), Depends(require_json)])
+async def correct(project_id: str, note_id: str, body: CorrectNoteRequest, store: Store = Depends(get_store),
+                  _project: Project = Depends(existing_project)) -> NoteCorrectionResultOut:
+    """Correct a description/constraint/tone note's text, kind, or applicability - or
+    split it into a standing note and a scene-specific one - without ever editing it in
+    place. See curate.correct_note for the full contract (concurrency, provenance,
+    review-state, retrieval, re-ingestion, and approval-staleness behavior).
+
+    One successor in the body is a plain correction; two is a split. Ownership
+    (owner_id) is never settable here - both/all successors always inherit the
+    original note's owner. expectedRevision/expectedStatus are both required, checked
+    atomically against the note being corrected - a stale pair is a 409, and nothing
+    is written (the caller's draft, the successors it already built, is not lost;
+    re-fetch the note and retry with the current values).
+    """
+    try:
+        result = await run_in_threadpool(
+            correct_note, store, project_id, note_id,
+            [NoteSuccessorSpec(kind=s.kind, body=s.body, scene_id=s.scene_id,
+                              include_descendants=s.include_descendants)
+             for s in body.successors],
+            reviewer=body.by, expected_revision=body.expected_revision,
+            expected_status=body.expected_status,
+        )
+    except NoteReviewConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await run_in_threadpool(note_correction_result_out, store, project_id, result)
+
 
 @router.post("/projects/{project_id}/locations/{location_id}/references/upload",
              response_model=ReferenceUploadOut, status_code=201,

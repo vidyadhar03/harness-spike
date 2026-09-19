@@ -72,7 +72,7 @@ class Project(Doc):
 # --- Source: one per dropped file ---------------------------------------------
 
 SourceKind = Literal["document", "image", "text", "table", "audio", "video", "other"]
-DocType = Literal["script", "lookbook", "recce", "research", "schedule", "notes", "reference", "unknown"]
+DocType = Literal["script", "lookbook", "recce", "research", "schedule", "notes", "reference", "concept", "unknown"]
 SourceStatus = Literal["uploaded", "digesting", "digested", "failed", "unsupported"]
 
 
@@ -116,13 +116,21 @@ class Source(Doc):
     # "ingest"    : uploaded for screenplay/notes ingestion; appears in GET /sources.
     # "reference" : stored only for visual reference; excluded from ingestion paths.
     # "both"      : was reference-only, then explicitly promoted via POST /sources.
+    # "concept"   : stored only for a location's uploaded concept-art version (see
+    #               ConceptVersion); excluded from ingestion paths exactly like
+    #               "reference". promote_source_to_ingest treats it exactly like a
+    #               "reference"-purpose source too: if the same bytes are later
+    #               explicitly uploaded via POST /sources, it is promoted to "both"
+    #               (ingest-eligible) the same way - there is no special-cased
+    #               exclusion for "concept" there, on purpose.
     #
     # IMPORTANT: source_purpose alone does NOT tell you whether a source has location
     # reference note attachments - that association lives entirely in Note.owner_id.
     # An "ingest"-purpose source can have reference notes; a "both"-purpose source has
     # reference notes AND is eligible for ingestion. Do not infer reference usage from
-    # this field; query notes_for_owners instead.
-    source_purpose: Literal["ingest", "reference", "both"] | None = None
+    # this field; query notes_for_owners instead. Similarly, whether a source backs a
+    # concept version lives entirely in ConceptVersion.source_id, never here.
+    source_purpose: Literal["ingest", "reference", "both", "concept"] | None = None
 
     @field_validator("storage_path")
     @classmethod
@@ -136,10 +144,12 @@ class Source(Doc):
         return self.superseded_by_source_id is not None
 
     @property
-    def effective_purpose(self) -> Literal["ingest", "reference", "both"]:
+    def effective_purpose(self) -> Literal["ingest", "reference", "both", "concept"]:
         """Backward-compatible purpose resolution.
 
-        Honors an explicit source_purpose when set. For legacy records written
+        Honors an explicit source_purpose when set - this is the only path that can
+        ever produce "concept": no legacy record predates that value, so a None
+        source_purpose (see below) never resolves to it. For legacy records written
         before this field existed, retains the origin_url-based distinction:
         - Wikimedia-fetched images always have origin_url set  -> 'reference'
         - Screenplay/notes uploads via register_file never do  -> 'ingest'
@@ -153,9 +163,9 @@ class Source(Doc):
     def is_ingest_eligible(self) -> bool:
         """Single authoritative check used by all five ingestion paths.
 
-        True for 'ingest' and 'both'; False for 'reference'. Callers must use
-        this property, not compare effective_purpose strings directly, so the
-        set of eligible values stays consistent if new purpose values are added.
+        True for 'ingest' and 'both'; False for 'reference' and 'concept'. Callers
+        must use this property, not compare effective_purpose strings directly, so
+        the set of eligible values stays consistent if new purpose values are added.
         """
         return self.effective_purpose in ("ingest", "both")
 
@@ -254,7 +264,7 @@ Entity = Annotated[Union[Location, Scene], Field(discriminator="type")]
 # --- Notes: the unit of memory ------------------------------------------------
 
 NoteKind = Literal["description", "constraint", "reference_image", "tone", "vocabulary"]
-RejectReason = Literal["false", "wrong_scope", "duplicate", "not_useful", "other"]
+RejectReason = Literal["false", "wrong_scope", "duplicate", "not_useful", "other", "corrected"]
 
 
 class NoteOrigin(Strict):
@@ -298,7 +308,16 @@ class Note(Doc):
     reviewed_at: datetime | None = None
     review_reason: RejectReason | None = None
     duplicate_of: str | None = None     # the surviving note, when rejected as a duplicate
-    supersedes_note_id: str | None = None
+    supersedes_note_id: str | None = None   # set on a NEW note: the note it replaces
+
+    # Set on the OLD note when curate.correct_note replaces it with one or two new
+    # notes (a correction, or a standing/scene-specific split) - the reciprocal of
+    # supersedes_note_id above, mirroring Source.superseded_by_source_id's existing
+    # revision-chain pattern. A note with entries here is never edited in place and
+    # never resurrected by re-ingestion (see curate.correct_note's docstring); it stays
+    # exactly as it was for history, just excluded from retrieval like any other
+    # rejected note.
+    superseded_by_note_ids: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _rules(self):
@@ -310,6 +329,8 @@ class Note(Doc):
             raise ValueError("project notes already apply everywhere")
         if self.duplicate_of is not None and self.review_reason != "duplicate":
             raise ValueError("duplicate_of requires review_reason == 'duplicate'")
+        if self.superseded_by_note_ids and self.review_reason != "corrected":
+            raise ValueError("superseded_by_note_ids requires review_reason == 'corrected'")
         if self.status == "proposed" and self.reviewed_revision is not None:
             raise ValueError("a proposed note has no review")
         return self
@@ -377,3 +398,141 @@ class ContextPack(Strict):
     reference_images: list[ReferenceImage] = Field(default_factory=list)
     sources: dict[str, str] = Field(default_factory=dict)     # source_id -> filename
     superseded_sources: list[str] = Field(default_factory=list)  # filenames, for a warning
+
+
+# --- concept art: uploaded versions and their locked approval -----------------
+
+class ConceptVersion(Doc):
+    """One uploaded concept-art image for a location. Immutable once created - a repeat
+    upload of the same bytes to the same location resolves to this same record (see
+    concepts.upload_concept_version) rather than creating a new one, and never touches
+    any existing ConceptApproval.
+
+    Deliberately not a Note: keeping concept art out of the Note collection is what
+    keeps it invisible to note review, retrieval context packs, and the references
+    pipeline's stale-note cleanup, with no filtering code needed anywhere.
+    """
+    id: str = Field(default_factory=lambda: new_id("cvn"))
+    location_id: str
+    source_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    filename: str
+    author: Author = "user"   # always "user" today; kept open for a future generated version
+
+    # Set iff this version was created via concepts.promote_reference_to_concept rather
+    # than a raw upload - both None means "uploaded directly". Points at the reference
+    # note (and its revision at promotion time) whose stored image this version reuses,
+    # so provenance survives even though no new bytes were written. Never rewritten -
+    # if a later promotion/upload resolves to this same (location_id, source_id) record
+    # via put_concept_version_if_absent, the existing values win untouched (see
+    # promote_reference_to_concept's docstring).
+    promoted_from_note_id: str | None = None
+    promoted_from_note_revision: int | None = None
+
+
+class ConditionalNoteSnapshot(Strict):
+    """One linked scene's requirements, captured at approval time - see ConceptApproval.
+
+    One entry per scene in the location's authoritative linked-scene roster
+    (retrieval.get_context's pack.scenes), regardless of whether that scene has any
+    scene-conditional notes - notes=[] on a roster scene means "no additional
+    requirements were extracted for this scene", a real fact, not a gap.
+
+    number/heading are denormalized display fields, added after label; both None on any
+    ConceptApproval persisted before that (see ConceptApproval.snapshot_schema_version -
+    such a record's own brief_conditional list may ALSO be incomplete as a roster
+    (pre-dates iterating pack.scenes instead of only scenes-with-notes), which is what
+    snapshot_schema_version actually flags; missing number/heading here is a narrower,
+    always-true-for-old-data symptom of that same age, not a separate gap to track.
+    """
+    scene_id: str
+    label: str
+    notes: list[Note] = Field(default_factory=list)
+    number: str | None = None
+    heading: str | None = None
+
+
+class InheritedNoteSnapshot(Strict):
+    """Ancestor-owned brief notes captured at approval time - see ConceptApproval."""
+    entity_id: str
+    name: str
+    notes: list[Note] = Field(default_factory=list)
+
+
+class ApprovedReference(Strict):
+    """One reference note exactly as explicitly selected and seen at approval time.
+
+    This class itself does not require status == "confirmed" - locking records what
+    the approver looked at, it does not itself confirm or reject anything, and this
+    model has no opinion on what fed it. In practice status is always "confirmed" here
+    today because concepts.build_approval_snapshot refuses to select anything else
+    (see its docstring) - that is a business rule enforced by the caller, not a
+    constraint of this model.
+    """
+    note_id: str
+    revision: int
+    status: ReviewStatus
+    guidance: str | None = None
+    direction: str | None = None
+    caption: str
+
+
+class ConceptApproval(Doc):
+    """An immutable, explicit lock of one location's visual direction.
+
+    Every successful lock writes a brand-new record (revision = prior current + 1,
+    starting at 1); no ConceptApproval is ever edited or deleted, so history is
+    preserved automatically. Which one is "current" for a location is tracked
+    separately by the store (see Store.get_current_approval /
+    Store.put_approval_if_current) so later brief/reference edits can never rewrite
+    an already-locked snapshot.
+    """
+    id: str = Field(default_factory=lambda: new_id("apr"))
+    location_id: str
+    revision: int = Field(default=1, ge=1)
+
+    concept_version_id: str
+    concept_source_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    concept_filename: str
+
+    brief_notes: list[Note] = Field(default_factory=list)                    # unconditional, owned
+    brief_conditional: list[ConditionalNoteSnapshot] = Field(default_factory=list)
+    brief_inherited: list[InheritedNoteSnapshot] = Field(default_factory=list)
+    brief_ancestors: list[str] = Field(default_factory=list)                 # ancestor names, display only
+    superseded_sources: list[str] = Field(default_factory=list)
+
+    references: list[ApprovedReference] = Field(default_factory=list)
+
+    # Free-text, user-supplied description of what the concept image depicts (e.g.
+    # "whole-house exterior", "bedroom interior - top view") - see
+    # concepts.MAX_DEPICTION_LABEL_LENGTH / _validate_depiction_label. Purely
+    # descriptive: never used to infer or change location_id, never validated against
+    # any room/location hierarchy, never a claim about spatial/geometric accuracy.
+    # None on any approval locked before this field existed, which is a true "no label
+    # was given" for that record, not an ambiguous gap - unlike snapshot_schema_version
+    # below, no version flag is needed for this one field.
+    depiction_label: str | None = None
+
+    # sha256 hex over the exact inputs above (see concepts._context_token) - the
+    # concurrency/staleness primitive: a lock request must recompute to the same
+    # token as what it was shown, and GET .../approval recomputes it against live
+    # state to expose whether the approved package is now stale.
+    context_token: str
+
+    # Bumped whenever the *shape/completeness semantics* of what gets captured here
+    # changes in a way that makes old data genuinely ambiguous to interpret under the
+    # new logic - not for every additive field (most, like depiction_label above, are
+    # safely None=absent on old records with no ambiguity). Version 1 (the default,
+    # meaning "this field was absent" - true for every record persisted before it
+    # existed): brief_conditional only contains scenes that had at least one
+    # scene-conditional note, so an old record's scene list may be silently
+    # INCOMPLETE relative to the location's actual linked-scene roster - a missing
+    # scene here must never be read as "confirmed no requirements". Version 2:
+    # brief_conditional always contains one entry per scene in the roster (see
+    # ConditionalNoteSnapshot), so an empty notes=[] there is a real fact. Read via
+    # concepts.CURRENT_SNAPSHOT_SCHEMA_VERSION; never bump a record after the fact -
+    # only a fresh lock stamps the current value.
+    snapshot_schema_version: int = 1
+
+    # Free-text label, not an authenticated identity - this system has no login.
+    locked_by: str | None = None
+    locked_at: datetime = Field(default_factory=utcnow)

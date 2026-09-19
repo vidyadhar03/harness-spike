@@ -1,17 +1,23 @@
-"""Human review actions over memory: merging duplicate entities.
+"""Human review actions over memory: merging duplicate entities, note review, and note
+correction/splitting.
 
 Ingest deliberately creates a new entity when it cannot confidently match an existing one,
 so visible duplicates are expected and a person resolves them here. Notes are never
 rewritten: retrieval follows merge chains, so a merge stays reversible by editing one field.
+The same "never edit in place" rule applies to a note's own reviewed assertion
+(body/owner/applicability) - see correct_note below, and models.Note's module docstring.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .models import Containment, Location, Note, RejectReason, ReviewStatus, Scene, utcnow
+from .models import (
+    PROJECT_SCOPE, Applicability, Containment, Location, Note, NoteOrigin, RejectReason,
+    ReviewStatus, Scene, utcnow,
+)
 from .ports import EntityDoc, Store
 from .resolver import norm
-from .retrieval import _Graph, resolve_scope
+from .retrieval import BRIEF_NOTE_KINDS, _Graph, _live, resolve_scope
 
 
 @dataclass
@@ -117,6 +123,17 @@ def review_note(store: Store, project_id: str, note_id: str, decision: ReviewSta
     see NoteReviewConflict). The CLI leaves both unset and keeps its unconditional behavior.
     """
     note = _get_note(store, project_id, note_id)
+    # A note replaced by correct_note is history, not a live claim: reviewing it would
+    # reactivate (or re-reason) something a human deliberately superseded, and would
+    # overwrite review_reason="corrected", breaking the lineage. Only refuse a caller
+    # who sees it as it really is (no expectation, or expecting "rejected"); a caller
+    # still expecting its old live status falls through to the CAS below and gets the
+    # usual 409, since their view is stale.
+    if note.superseded_by_note_ids and (expected_status is None or expected_status == note.status):
+        raise ValueError(
+            f"{note.id} was replaced by a correction ({', '.join(note.superseded_by_note_ids)}); "
+            "review the replacement note instead"
+        )
     if decision not in ("confirmed", "rejected"):
         raise ValueError("decision must be 'confirmed' or 'rejected'")
     if guidance is not None and (decision != "confirmed" or note.kind != "reference_image"):
@@ -196,3 +213,151 @@ def _would_cycle(graph: _Graph, child_id: str, parent_id: str) -> bool:
         seen.add(node.id)
         node = graph.by_id.get(nxt)
     return False
+
+
+# --- note correction / splitting ------------------------------------------------------
+
+@dataclass
+class NoteSuccessorSpec:
+    """One replacement for correct_note - either the sole successor of a plain
+    correction, or one half of a standing/scene-specific split."""
+    kind: str
+    body: str
+    scene_id: str | None = None
+    include_descendants: bool = False
+
+
+@dataclass
+class CorrectionResult:
+    original: Note              # now status="rejected", review_reason="corrected"
+    new_notes: list[Note]
+
+    def summary(self) -> str:
+        heads = "; ".join(" ".join(n.body.split())[:60] for n in self.new_notes)
+        return f"corrected `{self.original.id}` -> {len(self.new_notes)} note(s): {heads}"
+
+
+def _linked_scene_ids(graph: _Graph, owner_id: str) -> set[str]:
+    """The exact rule retrieval.get_context uses to compute a location's own linked
+    scenes (pack.scenes) - reused here rather than redefined, so a scene accepted by
+    correct_note is guaranteed to be one get_context/build_approval_snapshot would also
+    recognize as belonging to this location. PROJECT_SCOPE has no linked-scene concept
+    - always an empty set, which correctly makes any scene_id invalid for a project
+    note without a separate check."""
+    if owner_id == PROJECT_SCOPE:
+        return set()
+    return {
+        s.id for s in graph.by_id.values()
+        if isinstance(s, Scene) and _live(s)
+        and any((t := graph.target(lid)) is not None and t.id == owner_id for lid in s.location_ids)
+    }
+
+
+def correct_note(store: Store, project_id: str, note_id: str, successors: list[NoteSuccessorSpec], *,
+                 reviewer: str, expected_revision: int, expected_status: ReviewStatus) -> CorrectionResult:
+    """Replace one brief note (description/constraint/tone) with one corrected note, or
+    split it into two (typically one standing, one scene-specific) - the human
+    correction path for a note whose wording, kind, or scope needs fixing.
+
+    Never edits the original note's body/kind/applicability in place - mirrors
+    models.Note's own documented rule ("changing body/owner/applicability needs a new
+    note that supersedes the old one"). Instead: the original is marked
+    status="rejected", review_reason="corrected", superseded_by_note_ids=[the new
+    note(s)]; each new note is a fresh Note with author="user",
+    origin.producer="user", supersedes_note_id=original.id, status="proposed" (a
+    changed assertion has no reviewer sign-off yet - it is never carried forward from
+    the original, confirmed or not: see Note.assertion/review_is_current). Ownership
+    (owner_id) is unconditionally inherited from the original and cannot be changed
+    here - that is explicitly out of scope for this action.
+
+    Concurrency: expected_revision/expected_status are required and checked atomically
+    against the CURRENT original note by Store.correct_note (the exact same CAS
+    contract as put_note_if_current) - a stale pair raises NoteReviewConflict (-> 409
+    at the route), writing nothing at all, so the caller's draft (the successors list
+    it already built) is never lost; retry with a fresh read. The reject-original and
+    create-successor(s) writes happen in that one atomic call, so a split can never be
+    observed half-done.
+
+    Provenance is copied verbatim from the original onto every successor - this
+    function has no parameter for editing a citation/quote, so an edited body can never
+    masquerade as a different verbatim screenplay excerpt; Provenance.extracted_body
+    keeps showing exactly what was originally extracted, next to the new, human-
+    corrected Note.body, as the audit trail.
+
+    Retrieval: once the original is "rejected", retrieval._visible excludes it
+    unconditionally (regardless of include_proposed) - the existing visibility rule,
+    not new filtering code - so get_context/build_approval_snapshot immediately stop
+    showing it and start showing the new note(s) instead, with no further wiring.
+
+    Re-ingestion: a later ingest run of the same source cannot resurrect or overwrite
+    this correction. _commit's reconciliation only ever considers notes whose
+    origin.producer is "ingest" (or the pre-origin legacy None) - our new notes have
+    producer="user" and are invisible to it entirely - and for the original, whose
+    origin.producer IS still "ingest", _commit's own rule already treats any non-
+    "proposed" status (rejected included, for any reason) as a durable human decision
+    and writes nothing for a re-matched candidate. Both protections are existing
+    ingest.py behavior; nothing there needed to change for this to hold.
+
+    Approval staleness: an already-locked ConceptApproval snapshot is never rewritten
+    by this (see concepts.py) - GET .../approval will recompute the original as
+    changed/removed and the new note(s) as added, via the existing generic diff, and
+    report isStale accordingly. Re-approval is always a separate, explicit lock.
+
+    Raises LookupError if note_id is unknown, ValueError for anything else invalid
+    (unsupported kind, an already-rejected original, 1-2 successors required, a bad
+    kind/scene_id on a successor, or an owner that is no longer a live entity).
+    """
+    original = _get_note(store, project_id, note_id)
+    if original.kind not in BRIEF_NOTE_KINDS:
+        raise ValueError(
+            f"only {'/'.join(BRIEF_NOTE_KINDS)} notes can be corrected here; "
+            f"{original.id} is {original.kind!r}"
+        )
+    # Checked against the CALLER's claimed expected_status, not the freshly-read
+    # original.status: a caller who correctly expected "proposed"/"confirmed" but
+    # finds the note is now actually rejected (raced by someone else's correction or
+    # review) must get a concurrency conflict from the CAS below (409), not this
+    # business-rule error - only a caller who explicitly claims expected_status ==
+    # "rejected" is making the nonsensical request this guards against.
+    if expected_status == "rejected":
+        raise ValueError(f"{original.id} is already rejected; nothing to correct")
+    if not (1 <= len(successors) <= 2):
+        raise ValueError(f"correct_note takes 1 successor (a correction) or 2 (a split), "
+                         f"not {len(successors)}")
+
+    graph = _Graph(store.list_entities(project_id))
+    if original.owner_id != PROJECT_SCOPE:
+        owner = graph.by_id.get(original.owner_id)
+        if owner is None or not _live(owner):
+            raise ValueError(
+                f"{original.owner_id!r} is no longer a live entity; cannot correct notes owned by it"
+            )
+    scene_ids = _linked_scene_ids(graph, original.owner_id)
+
+    new_notes: list[Note] = []
+    for spec in successors:
+        if spec.kind not in BRIEF_NOTE_KINDS:
+            raise ValueError(
+                f"{spec.kind!r} is not a supported kind for a correction; use one of "
+                f"{', '.join(BRIEF_NOTE_KINDS)}"
+            )
+        if spec.scene_id is not None and spec.scene_id not in scene_ids:
+            raise ValueError(f"{spec.scene_id!r} is not a scene linked to {original.owner_id!r}")
+        new_notes.append(Note(
+            kind=spec.kind, body=spec.body, owner_id=original.owner_id,
+            applicability=Applicability(scene_id=spec.scene_id, include_descendants=spec.include_descendants),
+            author="user", mentions=list(original.mentions),
+            provenance=[p.model_copy() for p in original.provenance],
+            origin=NoteOrigin(producer="user", scope=original.owner_id, digest_version="user-correction-v1"),
+            supersedes_note_id=original.id,
+        ))
+
+    updated_original = original.touch(
+        status="rejected", review_reason="corrected",
+        superseded_by_note_ids=[n.id for n in new_notes],
+        reviewed_by=reviewer, reviewed_at=utcnow(), reviewed_revision=original.revision,
+    )
+    stored_original, stored_new = store.correct_note(
+        project_id, updated_original, new_notes, expected_revision, expected_status,
+    )
+    return CorrectionResult(original=stored_original, new_notes=stored_new)

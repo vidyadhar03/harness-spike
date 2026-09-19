@@ -29,10 +29,14 @@ async def start_ingest(project_id: str, body: IngestRequest, response: Response,
         if src is None:
             raise HTTPException(status_code=404, detail="source not found in project")
         if not src.is_ingest_eligible:
+            # effective_purpose is "reference" or "concept" here (the only two
+            # non-ingest-eligible values) - label accordingly so the message stays
+            # accurate for a concept-art source instead of misdescribing it.
+            label = "concept-art image" if src.effective_purpose == "concept" else "reference image"
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    "this source is stored as a reference image and cannot be used as "
+                    f"this source is stored as a {label} and cannot be used as "
                     "an ingestion input; it does not appear in GET /sources"
                 ),
             )

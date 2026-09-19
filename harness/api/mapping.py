@@ -6,16 +6,23 @@ resolution (reuses retrieval._Graph, exactly like harness.memory.curate already 
 """
 from __future__ import annotations
 
-from harness.memory.models import Location, Note, Provenance, Scene, Source
+from harness.memory.concepts import CORE_NOTES_CAVEAT, CURRENT_SNAPSHOT_SCHEMA_VERSION, approval_staleness_reasons
+from harness.memory.curate import CorrectionResult
+from harness.memory.models import ApprovedReference, ConceptApproval, ConceptVersion, Location, Note, Provenance, Scene, Source
 from harness.memory.ports import Store
 from harness.memory.references import strip_heading_prefix
 from harness.memory.resolver import natural_key
-from harness.memory.retrieval import _Graph, _live, _reference, get_context, resolve_scope
+from harness.memory.retrieval import BRIEF_NOTE_KINDS, _Graph, _live, _reference, get_context, resolve_scope
 
 from .dto import (
-    CitationOut, IngestSourceResultOut, LocationDetail, LocationSummary, NoteOut,
-    ReferenceListOut, ReferenceOut, SceneRefOut, SourceOut, SourceSummaryOut,
+    ApprovalInheritedOut, ApprovalPackageOut, ApprovalPreviewOut,
+    ApprovalStateOut, ApprovedReferenceOut, CitationOut, ConceptUploadOut, ConceptVersionListOut,
+    ConceptVersionOut, IngestSourceResultOut, LocationDetail, LocationSceneRequirementOut, LocationSummary, NoteCorrectionResultOut, NoteOut,
+    ReferenceListOut, ReferenceOut, ReviewResultOut, SceneRefOut, SceneRequirementOut, ScopedNoteOut, SourceOut, SourceSummaryOut,
 )
+
+_CORE_NOTE_KINDS = ("description", "tone")
+_PHYSICAL_NOTE_KINDS = ("constraint",)
 
 
 # --- locations --------------------------------------------------------------------------
@@ -65,6 +72,9 @@ def location_detail(store: Store, project_id: str, location_id: str) -> Location
     def notes_of(kind: str) -> list[NoteOut]:
         return [_note_out(n, pack.sources) for n in pack.notes if n.kind == kind]
 
+    notes_by_scene = {c.scene_id: c.notes for c in pack.conditional}
+    roster_ids = {s.id for s in pack.scenes}
+
     return LocationDetail(
         id=pack.entity.id, name=pack.entity.name, aliases=pack.entity.aliases, status=pack.entity.status,
         ancestors=[a.name for a in pack.ancestors],
@@ -72,13 +82,36 @@ def location_detail(store: Store, project_id: str, location_id: str) -> Location
         description_notes=notes_of("description"),
         constraint_notes=notes_of("constraint"),
         tone_notes=notes_of("tone"),
+        scene_requirements=[_location_scene_out(s.id, s.number, s.name, True, notes_by_scene.get(s.id, []),
+                                                pack.sources) for s in pack.scenes],
+        out_of_roster_scene_requirements=[
+            _location_scene_out(c.scene_id, None, c.label, False, c.notes, pack.sources)
+            for c in pack.conditional if c.scene_id not in roster_ids
+            if any(n.kind in BRIEF_NOTE_KINDS for n in c.notes)
+        ],
         superseded_sources=pack.superseded_sources,
+    )
+
+
+def _location_scene_out(scene_id: str, number: str | None, heading: str | None, linked: bool,
+                        notes: list[Note], sources: dict[str, str]) -> LocationSceneRequirementOut:
+    """Only get_context's own owned conditional notes are surfaced (pack.conditional) -
+    it never yields an ancestor's scene-scoped note (inherited notes are unconditional
+    only, by retrieval's own rule), so owned is always True today; the field exists so
+    a future retrieval change can't silently make an inherited note look editable."""
+    return LocationSceneRequirementOut(
+        scene_id=scene_id, number=number, heading=heading, linked=linked,
+        notes=[ScopedNoteOut(**_note_out(n, sources).model_dump(), owner_id=n.owner_id, owned=True,
+                             inherited_from=None, editable=n.kind in BRIEF_NOTE_KINDS)
+               for n in notes if n.kind in BRIEF_NOTE_KINDS],
     )
 
 
 def _note_out(n: Note, sources: dict[str, str]) -> NoteOut:
     return NoteOut(id=n.id, kind=n.kind, body=n.body, status=n.status, revision=n.revision,
-                   citations=[_citation(p, sources) for p in n.provenance])
+                   citations=[_citation(p, sources) for p in n.provenance],
+                   scene_id=n.applicability.scene_id,
+                   include_descendants=n.applicability.include_descendants)
 
 
 def _citation(p: Provenance, sources: dict[str, str]) -> CitationOut:
@@ -155,6 +188,179 @@ def _reference_out(ref, note: Note, project_id: str, *, owned: bool, inherited_f
     )
 
 
+# --- concept versions -------------------------------------------------------------------
+
+def _concept_version_out(project_id: str, v: ConceptVersion, approved_id: str | None) -> ConceptVersionOut:
+    return ConceptVersionOut(
+        id=v.id, image=f"/projects/{project_id}/concepts/{v.id}/image",
+        filename=v.filename, created_at=v.created_at, author=v.author,
+        approved=(v.id == approved_id),
+        promoted_from_note_id=v.promoted_from_note_id,
+        promoted_from_note_revision=v.promoted_from_note_revision,
+    )
+
+
+def concept_version_list(store: Store, project_id: str, location_id: str) -> ConceptVersionListOut:
+    """All uploaded concept versions for a location, plus which one (if any) is
+    currently approved - selecting a candidate in the UI is purely client-side state,
+    so there is nothing else here to persist or read back."""
+    graph = _Graph(store.list_entities(project_id))
+    scope_id = resolve_scope(store, project_id, location_id, graph)
+    entity = graph.by_id.get(scope_id)
+    if not isinstance(entity, Location):
+        raise ValueError(f"{location_id!r} is a scene; concept versions are per location")
+
+    current = store.get_current_approval(project_id, scope_id)
+    approved_id = current.concept_version_id if current else None
+    versions = store.list_concept_versions(project_id, scope_id)
+    return ConceptVersionListOut(
+        location_id=scope_id, approved_version_id=approved_id,
+        versions=[_concept_version_out(project_id, v, approved_id) for v in versions],
+    )
+
+
+def concept_upload_out(store: Store, project_id: str, version: ConceptVersion, *, created: bool) -> ConceptUploadOut:
+    current = store.get_current_approval(project_id, version.location_id)
+    approved_id = current.concept_version_id if current else None
+    return ConceptUploadOut(
+        id=version.id, image=f"/projects/{project_id}/concepts/{version.id}/image",
+        filename=version.filename, created=created, approved=(version.id == approved_id),
+        promoted_from_note_id=version.promoted_from_note_id,
+        promoted_from_note_revision=version.promoted_from_note_revision,
+    )
+
+
+# --- concept approval ---------------------------------------------------------------------
+
+def _all_approval_notes(pkg) -> list[Note]:
+    """pkg is a ConceptApproval or concepts.ApprovalSnapshot - the field is named
+    brief_conditional on ConceptApproval and scene_requirements on ApprovalSnapshot
+    (see concepts.ApprovalSnapshot), both carrying the same per-scene shape."""
+    scenes = getattr(pkg, "scene_requirements", None)
+    if scenes is None:
+        scenes = pkg.brief_conditional
+    return (pkg.brief_notes + [n for c in scenes for n in c.notes]
+           + [n for i in pkg.brief_inherited for n in i.notes])
+
+
+def _approval_sources(store: Store, project_id: str, pkg) -> dict[str, str]:
+    notes = _all_approval_notes(pkg)
+    source_ids = [p.source_id for n in notes for p in n.provenance if p.source_id]
+    sources = store.get_sources(project_id, source_ids)
+    return {sid: s.filename for sid, s in sources.items()}
+
+
+def _core_and_physical(notes: list[Note]) -> tuple[list[Note], list[Note]]:
+    """Splits a flat unconditional brief-note list into "core description" (kind in
+    description/tone) and "physical/set-dressing" (kind == constraint) - pure
+    presentation reuse of the existing kind field, no reclassification. See
+    concepts.CORE_NOTES_CAVEAT for the one remaining, honestly-disclosed ambiguity this
+    split does not resolve."""
+    core = [n for n in notes if n.kind in _CORE_NOTE_KINDS]
+    physical = [n for n in notes if n.kind in _PHYSICAL_NOTE_KINDS]
+    return core, physical
+
+
+def _scene_requirement_out(scenes, sources: dict[str, str]) -> list[SceneRequirementOut]:
+    return [SceneRequirementOut(scene_id=s.scene_id, number=s.number, heading=s.heading,
+                                notes=[_note_out(n, sources) for n in s.notes]) for s in scenes]
+
+
+def _approval_inherited_out(inhs, sources: dict[str, str]) -> list[ApprovalInheritedOut]:
+    return [ApprovalInheritedOut(entity_id=i.entity_id, name=i.name,
+                                 notes=[_note_out(n, sources) for n in i.notes]) for i in inhs]
+
+
+def _approved_reference_out(project_id: str, r: ApprovedReference) -> ApprovedReferenceOut:
+    return ApprovedReferenceOut(
+        note_id=r.note_id, revision=r.revision, status=r.status, guidance=r.guidance,
+        direction=r.direction, caption=r.caption,
+        image=f"/projects/{project_id}/references/{r.note_id}/image",
+    )
+
+
+def approval_package_out(store: Store, project_id: str, approval: ConceptApproval) -> ApprovalPackageOut:
+    sources = _approval_sources(store, project_id, approval)
+    core, physical = _core_and_physical(approval.brief_notes)
+    return ApprovalPackageOut(
+        id=approval.id, location_id=approval.location_id, revision=approval.revision,
+        concept_version_id=approval.concept_version_id,
+        concept_image=f"/projects/{project_id}/concepts/{approval.concept_version_id}/image",
+        concept_filename=approval.concept_filename, depiction_label=approval.depiction_label,
+        core_notes=[_note_out(n, sources) for n in core], core_notes_caveat=CORE_NOTES_CAVEAT,
+        physical_notes=[_note_out(n, sources) for n in physical],
+        scene_requirements=_scene_requirement_out(approval.brief_conditional, sources),
+        scene_coverage_complete=(approval.snapshot_schema_version >= CURRENT_SNAPSHOT_SCHEMA_VERSION),
+        brief_inherited=_approval_inherited_out(approval.brief_inherited, sources),
+        brief_ancestors=approval.brief_ancestors, superseded_sources=approval.superseded_sources,
+        references=[_approved_reference_out(project_id, r) for r in approval.references],
+        context_token=approval.context_token, locked_by=approval.locked_by, locked_at=approval.locked_at,
+    )
+
+
+def approval_preview_out(store: Store, project_id: str, snapshot) -> ApprovalPreviewOut:
+    """snapshot is a concepts.ApprovalSnapshot - see concepts.build_approval_snapshot.
+    Always complete scene coverage (a preview is always computed fresh against current
+    retrieval - there is no legacy/partial state for something that isn't persisted)."""
+    sources = _approval_sources(store, project_id, snapshot)
+    core, physical = _core_and_physical(snapshot.brief_notes)
+    return ApprovalPreviewOut(
+        location_id=snapshot.location_id, concept_version_id=snapshot.concept_version.id,
+        concept_image=f"/projects/{project_id}/concepts/{snapshot.concept_version.id}/image",
+        concept_filename=snapshot.concept_version.filename, depiction_label=snapshot.depiction_label,
+        core_notes=[_note_out(n, sources) for n in core], core_notes_caveat=CORE_NOTES_CAVEAT,
+        physical_notes=[_note_out(n, sources) for n in physical],
+        scene_requirements=_scene_requirement_out(snapshot.scene_requirements, sources),
+        brief_inherited=_approval_inherited_out(snapshot.brief_inherited, sources),
+        brief_ancestors=snapshot.brief_ancestors, superseded_sources=snapshot.superseded_sources,
+        references=[_approved_reference_out(project_id, r) for r in snapshot.references],
+        context_token=snapshot.context_token,
+    )
+
+
+def approval_state(store: Store, project_id: str, location_id: str) -> ApprovalStateOut:
+    """GET .../approval: the current approved package (or none) plus its revision (for
+    the next lock's expectedRevision) and whether live inputs have since diverged from
+    it. This is also the retrieval boundary a later "Send to 3D blockout" action would
+    read from - nothing here calls out to anything, or marks a package as sent.
+
+    Always returns the stored package even when it is stale, and even when every
+    reference it named has since been rejected/removed or the location itself was
+    later rejected/merged - approval_staleness_reasons never raises, so a diverged
+    package is reported (isStale + staleReasons), never a 500 or a missing approval.
+    """
+    graph = _Graph(store.list_entities(project_id))
+    scope_id = resolve_scope(store, project_id, location_id, graph)
+    entity = graph.by_id.get(scope_id)
+    if not isinstance(entity, Location):
+        raise ValueError(f"{location_id!r} is a scene; concept approval is per location")
+
+    current = store.get_current_approval(project_id, scope_id)
+    if current is None:
+        return ApprovalStateOut(location_id=scope_id, revision=0, approval=None, is_stale=False)
+
+    reasons = approval_staleness_reasons(store, project_id, current)
+    return ApprovalStateOut(location_id=scope_id, revision=current.revision,
+                            approval=approval_package_out(store, project_id, current),
+                            is_stale=bool(reasons), stale_reasons=reasons)
+
+
+# --- note correction / splitting -------------------------------------------------------
+
+def note_correction_result_out(store: Store, project_id: str, result: CorrectionResult) -> NoteCorrectionResultOut:
+    all_notes = [result.original, *result.new_notes]
+    source_ids = [p.source_id for n in all_notes for p in n.provenance if p.source_id]
+    sources = {sid: s.filename for sid, s in store.get_sources(project_id, source_ids).items()}
+    return NoteCorrectionResultOut(
+        original=ReviewResultOut(
+            id=result.original.id, status=result.original.status, revision=result.original.revision,
+            reviewed_by=result.original.reviewed_by, reviewed_at=result.original.reviewed_at,
+            guidance=result.original.guidance, review_reason=result.original.review_reason,
+        ),
+        new_notes=[_note_out(n, sources) for n in result.new_notes],
+    )
+
+
 # --- misc -----------------------------------------------------------------------------
 
 def find_note(store: Store, project_id: str, note_id: str) -> Note | None:
@@ -174,7 +380,7 @@ def source_out(src: Source, *, created: bool) -> SourceOut:
 
 
 def uploaded_sources(store: Store, project_id: str) -> list[SourceSummaryOut]:
-    """Sources eligible for ingestion - excludes reference-only assets.
+    """Sources eligible for ingestion - excludes reference-only and concept-only assets.
 
     Uses Source.is_ingest_eligible (which reads effective_purpose) as the exclusion
     signal. This is backward-compatible:
@@ -182,10 +388,10 @@ def uploaded_sources(store: Store, project_id: str) -> list[SourceSummaryOut]:
       to effective_purpose="reference" and are excluded, same as before.
     - Legacy screenplay/notes sources (source_purpose=None, origin_url=None) resolve
       to effective_purpose="ingest" and are included, same as before.
-    - New sources have an explicit source_purpose="ingest"|"reference"|"both"; only
-      "reference" is excluded.
-    - "both" sources were reference-only images explicitly promoted via POST /sources;
-      they are included here and eligible for ingest.
+    - New sources have an explicit source_purpose="ingest"|"reference"|"both"|"concept";
+      only "reference" and "concept" are excluded.
+    - "both" sources started as "reference" or "concept" and were explicitly promoted
+      via POST /sources; they are included here and eligible for ingest either way.
 
     doc_type alone would not be reliable: a genuinely uploaded lookbook/reference
     document can be classified doc_type="reference" by ingestion, which would wrongly

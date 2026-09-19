@@ -8,7 +8,7 @@ from typing import Protocol, TypeVar, Union
 
 from pydantic import BaseModel
 
-from .models import Location, Note, Project, Scene, Source, new_id, utcnow
+from .models import ConceptApproval, ConceptVersion, Location, Note, Project, Scene, Source, new_id, utcnow
 
 T = TypeVar("T", bound=BaseModel)
 EntityDoc = Union[Location, Scene]
@@ -69,6 +69,21 @@ class NoteReviewConflict(RuntimeError):
         self.note_id = note_id
         self.expected_revision, self.actual_revision = expected_revision, actual_revision
         self.expected_status, self.actual_status = expected_status, actual_status
+
+
+class ApprovalConflict(RuntimeError):
+    """put_approval_if_current found a different current approval than expected_revision.
+
+    Raised instead of silently making two concurrent locks both "the" current approval,
+    or letting a lock proceed against a revision the caller never actually saw. Distinct
+    from a stale context_token (concepts.StaleApprovalContext): this guards races between
+    concurrent lock attempts, not whether the material being locked is itself outdated.
+    """
+    def __init__(self, location_id: str, expected_revision: int, actual_revision: int):
+        super().__init__(f"location {location_id} approval is at revision={actual_revision}, "
+                         f"expected {expected_revision}")
+        self.location_id = location_id
+        self.expected_revision, self.actual_revision = expected_revision, actual_revision
 
 
 class LLM(Protocol):
@@ -132,7 +147,9 @@ class Store(Protocol):
         """
         ...
     def promote_source_to_ingest(self, project_id: str, source_id: str) -> Source:
-        """Atomically promote a reference-only source to dual 'both' purpose.
+        """Atomically promote a non-ingest-eligible source (source_purpose 'reference'
+        or 'concept') to dual 'both' purpose - generic over which non-ingest purpose it
+        started as; 'concept' is not special-cased out of this.
 
         Reads the current record under the lock/transaction and:
         - Returns it unchanged if already ingest-eligible (is_ingest_eligible is True).
@@ -179,7 +196,81 @@ class Store(Protocol):
         NoteReviewConflict's docstring).
         """
         ...
+    def correct_note(self, project_id: str, original_update: Note, new_notes: list[Note],
+                     expected_revision: int, expected_status: str) -> tuple[Note, list[Note]]:
+        """Atomically transition original_update.id to original_update's own new state
+        AND write new_notes, iff the currently stored note at original_update.id is at
+        (expected_revision, expected_status) - the exact same CAS contract as
+        put_note_if_current, extended to a second, related write.
+
+        Raises NoteReviewConflict (writing NOTHING at all - neither the transition nor
+        any new note) on a mismatch, mirroring put_note_if_current exactly. This is
+        what curate.correct_note relies on for "stale edits return 409 without losing
+        the user's draft" and for the split case being atomic: retrieval can never
+        observe the original rejected without its replacement(s) present, or a
+        replacement present while the original still looks live.
+
+        original_update is expected to already be the caller's fully-formed successor
+        state (status="rejected", review_reason="corrected", superseded_by_note_ids set
+        - see curate.correct_note) - this method does not derive it; it only guards and
+        commits the write, exactly like put_note_if_current does for a plain review.
+        """
+        ...
     def delete_notes(self, project_id: str, note_ids: list[str]) -> None: ...
+    def put_concept_version_if_absent(self, project_id: str, version: ConceptVersion) -> tuple[ConceptVersion, bool]:
+        """Write only if no version with this ID currently exists. Atomic per adapter.
+
+        Returns (version, True) when written, (existing, False) when the ID was already
+        present - the caller's deterministic ID (see concepts.upload_concept_version)
+        makes a repeat upload of the same bytes to the same location resolve here.
+        """
+        ...
+    def list_concept_versions(self, project_id: str, location_id: str) -> list[ConceptVersion]:
+        """Ordered by (created_at, id) - oldest first, deterministic."""
+        ...
+    def get_concept_version(self, project_id: str, version_id: str) -> ConceptVersion | None: ...
+    def get_current_approval(self, project_id: str, location_id: str) -> ConceptApproval | None:
+        """The one ConceptApproval currently in effect for this location, or None."""
+        ...
+    def put_approval_if_current(self, project_id: str, location_id: str, approval: ConceptApproval,
+                                expected_revision: int) -> tuple[ConceptApproval, bool]:
+        """Compare-and-swap the location's "current approval" pointer.
+
+        WHAT THIS DOES NOT VALIDATE: the underlying brief/reference content behind
+        approval.context_token. That check already happened once, by the time this is
+        called, in concepts.lock_approval - which recomputes the snapshot fresh and
+        compares it to what the caller was shown, then builds `approval` directly from
+        that validated snapshot. This method's job is narrower: is this atomically
+        still the right thing to become "current," never "is this still fresh."
+        Concretely, this operation is atomic over the pointer + history write, NOT over
+        a fresh re-read of Notes/references - a concurrent edit landing between
+        lock_approval's validation and this call is not caught here (see
+        concepts.lock_approval's docstring for the full validate/build/commit boundary,
+        and why: implementing true commit-time context revalidation would mean this
+        method re-running build_approval_snapshot's store reads inside its own
+        lock/transaction, which no Store implementation does today). What IS
+        guaranteed atomically, checked in two steps:
+
+        expected_revision is the revision of the current approval as last seen by the
+        caller (0 meaning "I believe none exists yet").
+
+        1. Idempotency first, and this check happens *inside* this same atomic
+           operation (never before calling it, never by a separate pre-check that could
+           race against a concurrent writer): if a current approval already exists and
+           its context_token equals approval.context_token - i.e. the caller's already-
+           validated snapshot is already exactly what's current - returns (that
+           approval, False) unconditionally, even if expected_revision is stale. This
+           is what makes a retry (or a second concurrent request locking the identical
+           already-validated package) safe and a no-op, without ever short-circuiting
+           on a token the caller merely claims rather than one this method itself
+           compares against the current record.
+        2. Otherwise, the write only proceeds if the current revision (0 if none exists)
+           equals expected_revision; raises ApprovalConflict otherwise (writing nothing).
+           On success, stores approval with revision = current_revision + 1, moves the
+           "current" pointer to it, and returns (stored, True). The prior current
+           approval, if any, is left untouched in history - never edited or deleted.
+        """
+        ...
     def replace_notes(self, project_id: str, to_delete: list[str], to_put: list[Note],
                       expected_status: dict[str, str] | None = None) -> None:
         """Atomically delete old notes and write new ones.
@@ -244,12 +335,17 @@ class MemoryStore:
         self.notes: dict[tuple[str, str], Note] = {}
         self.locks: dict[str, str] = {}
         self.lock_taken_at: dict[str, datetime] = {}
+        self.concept_versions: dict[tuple[str, str], ConceptVersion] = {}
+        self.approvals: dict[tuple[str, str], ConceptApproval] = {}          # full history
+        self.current_approval: dict[tuple[str, str], str] = {}              # (pid, location_id) -> approval id
         # Guards put_source_if_absent, promote_source_to_ingest, and put_note_if_absent.
         # Existing unconditional writes (put_source, put_notes) remain unlocked because
         # they are not called from concurrent paths today; only the conditional operations
         # that must be atomic across threads need the lock.
         self._sources_lock = threading.Lock()
         self._notes_lock = threading.Lock()
+        self._concepts_lock = threading.Lock()
+        self._approvals_lock = threading.Lock()
 
     def get_project(self, project_id):
         return self.projects.get(project_id)
@@ -374,6 +470,20 @@ class MemoryStore:
                 raise NoteReviewConflict(note.id, expected_revision, current_rev, expected_status, current_status)
             self.notes[(project_id, note.id)] = note.model_copy(deep=True)
 
+    def correct_note(self, project_id, original_update, new_notes, expected_revision, expected_status):
+        with self._notes_lock:
+            current = self.notes.get((project_id, original_update.id))
+            current_rev = current.revision if current is not None else None
+            current_status = current.status if current is not None else None
+            if current_rev != expected_revision or current_status != expected_status:
+                raise NoteReviewConflict(original_update.id, expected_revision, current_rev,
+                                         expected_status, current_status)
+            self.notes[(project_id, original_update.id)] = original_update.model_copy(deep=True)
+            for n in new_notes:
+                self.notes[(project_id, n.id)] = n.model_copy(deep=True)
+            return (self.notes[(project_id, original_update.id)].model_copy(deep=True),
+                   [self.notes[(project_id, n.id)].model_copy(deep=True) for n in new_notes])
+
     def delete_notes(self, project_id, note_ids):
         with self._notes_lock:
             for i in note_ids:
@@ -394,3 +504,43 @@ class MemoryStore:
                     self.notes.pop((project_id, nid), None)
             for n in to_put:
                 self.notes[(project_id, n.id)] = n.model_copy(deep=True)
+
+    def put_concept_version_if_absent(self, project_id, version):
+        with self._concepts_lock:
+            key = (project_id, version.id)
+            existing = self.concept_versions.get(key)
+            if existing is not None:
+                return existing.model_copy(deep=True), False
+            stored = version.model_copy(deep=True)
+            self.concept_versions[key] = stored
+            return stored, True
+
+    def list_concept_versions(self, project_id, location_id):
+        versions = [v.model_copy(deep=True) for (p, _), v in self.concept_versions.items()
+                   if p == project_id and v.location_id == location_id]
+        return sorted(versions, key=lambda v: (v.created_at, v.id))
+
+    def get_concept_version(self, project_id, version_id):
+        v = self.concept_versions.get((project_id, version_id))
+        return v.model_copy(deep=True) if v else None
+
+    def get_current_approval(self, project_id, location_id):
+        aid = self.current_approval.get((project_id, location_id))
+        if aid is None:
+            return None
+        a = self.approvals.get((project_id, aid))
+        return a.model_copy(deep=True) if a else None
+
+    def put_approval_if_current(self, project_id, location_id, approval, expected_revision):
+        with self._approvals_lock:
+            aid = self.current_approval.get((project_id, location_id))
+            current = self.approvals.get((project_id, aid)) if aid else None
+            current_rev = current.revision if current is not None else 0
+            if current is not None and current.context_token == approval.context_token:
+                return current.model_copy(deep=True), False
+            if current_rev != expected_revision:
+                raise ApprovalConflict(location_id, expected_revision, current_rev)
+            stored = approval.model_copy(update={"revision": current_rev + 1}, deep=True)
+            self.approvals[(project_id, stored.id)] = stored.model_copy(deep=True)
+            self.current_approval[(project_id, location_id)] = stored.id
+            return stored, True

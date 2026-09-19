@@ -389,7 +389,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"source {args.source} not found in project {args.project_id}", file=sys.stderr)
                 return 1
             if not src.is_ingest_eligible:
-                print(f"source {args.source} is stored as a reference image and cannot be ingested", file=sys.stderr)
+                label = "concept-art image" if src.effective_purpose == "concept" else "reference image"
+                print(f"source {args.source} is stored as a {label} and cannot be ingested", file=sys.stderr)
                 return 1
             sources = [src]
         else:

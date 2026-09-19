@@ -22,6 +22,7 @@ from harness.memory.factory import build_blobs, build_firestore_client, build_im
 from harness.memory.ports import LLM, Blobs, Images, Store
 
 from .jobs import FirestoreJobStore, InMemoryJobStore, Job, JobRunner, JobStore
+from .routes import concepts as concepts_routes
 from .routes import images as images_routes
 from .routes import ingest as ingest_routes
 from .routes import jobs as jobs_routes
@@ -172,6 +173,7 @@ def create_app(*, settings: Settings | None = None, api_settings: ApiSettings | 
     app.include_router(references_routes.router)
     app.include_router(jobs_routes.router)
     app.include_router(images_routes.router)
+    app.include_router(concepts_routes.router)
     return app
 
 

@@ -7,8 +7,10 @@ import time
 from pydantic import TypeAdapter
 
 from .config import Settings
-from .models import Entity, Note, Project, Source
-from .ports import Blob, EntityDoc, NoteReviewConflict, OutputTruncated, ReplacementTooLarge, Part, T, Text, Uri
+from .models import ConceptApproval, ConceptVersion, Entity, Note, Project, Source
+from .ports import (
+    ApprovalConflict, Blob, EntityDoc, NoteReviewConflict, OutputTruncated, ReplacementTooLarge, Part, T, Text, Uri,
+)
 from .schemas import gemini_schema, parse_json
 
 log = logging.getLogger(__name__)
@@ -83,7 +85,8 @@ class FirestoreStore:
         return _create(transaction)
 
     def promote_source_to_ingest(self, project_id, source_id):
-        """Atomically promote a reference-only source to dual 'both' purpose.
+        """Atomically promote a non-ingest-eligible source ('reference' or 'concept'
+        purpose) to dual 'both' purpose - generic over which one it started as.
 
         Reads the source inside the transaction and returns it unchanged if already
         ingest-eligible - a delayed second promotion after ingestion started must not
@@ -102,8 +105,9 @@ class FirestoreStore:
             if src.is_ingest_eligible:
                 # Already ingest-eligible (ingest or both): preserve current state.
                 return src
-            # Transition from reference-only: mark as both and reset ingestion state
-            # so ingest_source does not skip it as already-digested.
+            # Transition from a non-ingest purpose ('reference' or 'concept'): mark as
+            # both and reset ingestion state so ingest_source does not skip it as
+            # already-digested.
             updated = src.touch(
                 source_purpose="both",
                 status="uploaded",
@@ -267,8 +271,106 @@ class FirestoreStore:
 
         _swap(transaction)
 
+    def correct_note(self, project_id, original_update, new_notes, expected_revision, expected_status):
+        """Same transactional CAS as put_note_if_current, extended to write new_notes'
+        documents inside the same transaction - so a correction/split can never be
+        observed half-applied (original rejected but no successor, or a successor
+        present while the original still looks live). Not exercised against real or
+        emulated Firestore by this project's automated tests - see put_note_if_current's
+        own docstring for that caveat, which applies identically here.
+        """
+        ref = self._col(project_id, "notes").document(original_update.id)
+        notes_col = self._col(project_id, "notes")
+        transaction = self._db.transaction()
+
+        @firestore_transactional(self._db)
+        def _correct(tx):
+            snap = ref.get(transaction=tx)
+            data = snap.to_dict() if snap.exists else {}
+            current_rev = data.get("revision") if snap.exists else None
+            current_status = data.get("status") if snap.exists else None
+            if current_rev != expected_revision or current_status != expected_status:
+                raise NoteReviewConflict(original_update.id, expected_revision, current_rev,
+                                         expected_status, current_status)
+            tx.set(ref, original_update.model_dump())
+            for n in new_notes:
+                tx.set(notes_col.document(n.id), n.model_dump())
+
+        _correct(transaction)
+        return original_update, new_notes
+
     def delete_notes(self, project_id, note_ids):
         self._write(project_id, "notes", [(i, None) for i in note_ids])
+
+    def put_concept_version_if_absent(self, project_id, version):
+        """Atomic create-if-absent, same shape as put_source_if_absent/put_note_if_absent."""
+        ref = self._col(project_id, "concept_versions").document(version.id)
+        transaction = self._db.transaction()
+
+        @firestore_transactional(self._db)
+        def _create(tx):
+            snap = ref.get(transaction=tx)
+            if snap.exists:
+                return ConceptVersion.model_validate(snap.to_dict()), False
+            tx.set(ref, version.model_dump())
+            return version, True
+
+        return _create(transaction)
+
+    def list_concept_versions(self, project_id, location_id):
+        from google.cloud.firestore_v1.base_query import FieldFilter
+
+        q = self._col(project_id, "concept_versions").where(filter=FieldFilter("location_id", "==", location_id))
+        versions = [ConceptVersion.model_validate(d.to_dict()) for d in q.stream()]
+        return sorted(versions, key=lambda v: (v.created_at, v.id))
+
+    def get_concept_version(self, project_id, version_id):
+        snap = self._col(project_id, "concept_versions").document(version_id).get()
+        return ConceptVersion.model_validate(snap.to_dict()) if snap.exists else None
+
+    def _approval_pointer(self, project_id, location_id):
+        return self._project(project_id).collection("concept_approval_current").document(location_id)
+
+    def get_current_approval(self, project_id, location_id):
+        ptr_snap = self._approval_pointer(project_id, location_id).get()
+        if not ptr_snap.exists:
+            return None
+        aid = ptr_snap.to_dict().get("approval_id")
+        snap = self._col(project_id, "concept_approvals").document(aid).get()
+        return ConceptApproval.model_validate(snap.to_dict()) if snap.exists else None
+
+    def put_approval_if_current(self, project_id, location_id, approval, expected_revision):
+        """Transactional CAS on the location's "current approval" pointer.
+
+        Same read-check-write-inside-transaction shape as put_note_if_current (see its
+        docstring for the general pattern this follows) - not exercised against real or
+        emulated Firestore by this project's automated tests, which drive this behavior
+        only through MemoryStore.put_approval_if_current.
+        """
+        ptr_ref = self._approval_pointer(project_id, location_id)
+        approvals_col = self._col(project_id, "concept_approvals")
+        transaction = self._db.transaction()
+
+        @firestore_transactional(self._db)
+        def _lock(tx):
+            ptr_snap = ptr_ref.get(transaction=tx)
+            current = None
+            if ptr_snap.exists:
+                aid = ptr_snap.to_dict().get("approval_id")
+                cur_snap = approvals_col.document(aid).get(transaction=tx)
+                if cur_snap.exists:
+                    current = ConceptApproval.model_validate(cur_snap.to_dict())
+            current_rev = current.revision if current is not None else 0
+            if current is not None and current.context_token == approval.context_token:
+                return current, False
+            if current_rev != expected_revision:
+                raise ApprovalConflict(location_id, expected_revision, current_rev)
+            stored = approval.model_copy(update={"revision": current_rev + 1})
+            tx.set(approvals_col.document(stored.id), stored.model_dump())
+            tx.set(ptr_ref, {"approval_id": stored.id, "revision": stored.revision})
+            return stored, True
+
+        return _lock(transaction)
 
     def replace_notes(self, project_id, to_delete, to_put, expected_status=None):
         """Atomic note replacement with precondition checks.
