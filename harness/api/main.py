@@ -19,9 +19,13 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from harness.memory.config import Settings
 from harness.memory.factory import build_blobs, build_firestore_client, build_images, build_store
+from harness.memory.concept_generation import ConceptGenerationService, GenerationConfig
+from harness.memory.imagegen import ImageProvider
 from harness.memory.ports import LLM, Blobs, Images, Store
 
+from .generation import GenerationDispatcher
 from .jobs import FirestoreJobStore, InMemoryJobStore, Job, JobRunner, JobStore
+from .routes import concept_generation as concept_generation_routes
 from .routes import concepts as concepts_routes
 from .routes import images as images_routes
 from .routes import ingest as ingest_routes
@@ -117,7 +121,8 @@ async def run_startup_checks(job_store: JobStore, store: Store, timeout_s: float
 
 def create_app(*, settings: Settings | None = None, api_settings: ApiSettings | None = None,
               store: Store | None = None, blobs: Blobs | None = None, images: Images | None = None,
-              job_store: JobStore | None = None, llm_factory: Callable[[], LLM] | None = None) -> FastAPI:
+              job_store: JobStore | None = None, llm_factory: Callable[[], LLM] | None = None,
+              image_provider: ImageProvider | None = None, run_generation_jobs: bool = True) -> FastAPI:
     """Builds a fully-wired app.
 
     Tests pass store=MemoryStore(), blobs=MemoryBlobs(), images=MemoryImages(...), a fake
@@ -132,6 +137,19 @@ def create_app(*, settings: Settings | None = None, api_settings: ApiSettings | 
     blobs = blobs or build_blobs(settings)
     images = images or build_images()
     job_store = job_store or InMemoryJobStore()
+    if image_provider is None:
+        from harness.memory.luma import from_env as luma_from_env
+        image_provider = luma_from_env(max_request_bytes=api_settings.generation_max_request_bytes)
+    # The service always exists so job history and saved candidates stay readable; only actions that
+    # need the provider (preview/submit/resume/resolve/recovery) require one - see ProviderNotConfigured.
+    generation_service = ConceptGenerationService(
+        store, blobs, settings, image_provider,
+        config=GenerationConfig(default_model=api_settings.generation_default_model,
+                                poll_interval_s=api_settings.generation_poll_interval_s,
+                                max_wait_s=api_settings.generation_max_wait_s,
+                                lease_s=api_settings.generation_lease_s,
+                                max_output_pixels=api_settings.generation_max_output_pixels))
+    generation_dispatcher = None
 
     job_runner = JobRunner(store=store, blobs=blobs, images=images, settings=settings,
                            job_store=job_store, max_concurrent_jobs=api_settings.max_concurrent_jobs,
@@ -147,7 +165,21 @@ def create_app(*, settings: Settings | None = None, api_settings: ApiSettings | 
         # clearly instead of leaving "Waiting for application startup." on screen
         # indefinitely.
         await run_startup_checks(job_store, store, api_settings.startup_timeout_s)
-        yield
+        # Recovery only touches unowned / expired-lease jobs (never a live worker's) and never
+        # resubmits; see ConceptGenerationService.recover. Runs even without a provider so that
+        # bookkeeping is repaired - it just has nothing to resume then.
+        for pid, jid in await _bounded_startup_call(
+                "recovering concept generation jobs", generation_service.recover,
+                api_settings.startup_timeout_s, lambda code: os._exit(code)) or []:
+            if generation_dispatcher is not None:
+                generation_dispatcher.schedule(pid, jid)
+        if generation_dispatcher is not None:
+            generation_dispatcher.start_sweeper(api_settings.generation_sweep_interval_s)
+        try:
+            yield
+        finally:
+            if generation_dispatcher is not None:
+                await generation_dispatcher.stop()
 
     app = FastAPI(title="video-harness API", lifespan=lifespan)
     app.state.settings = settings
@@ -156,6 +188,12 @@ def create_app(*, settings: Settings | None = None, api_settings: ApiSettings | 
     app.state.blobs = blobs
     app.state.images = images
     app.state.job_runner = job_runner
+    app.state.generation_service = generation_service
+    if image_provider is not None:
+        generation_dispatcher = GenerationDispatcher(
+            generation_service, max_concurrent=api_settings.max_concurrent_generations,
+            enabled=run_generation_jobs)
+    app.state.generation_dispatcher = generation_dispatcher
 
     # TrustedHostMiddleware guards the server itself against a forged Host header on a
     # direct (non-browser) request; CORSMiddleware only ever constrains what a *browser*
@@ -174,6 +212,7 @@ def create_app(*, settings: Settings | None = None, api_settings: ApiSettings | 
     app.include_router(jobs_routes.router)
     app.include_router(images_routes.router)
     app.include_router(concepts_routes.router)
+    app.include_router(concept_generation_routes.router)
     return app
 
 

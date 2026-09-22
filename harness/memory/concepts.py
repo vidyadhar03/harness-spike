@@ -76,6 +76,32 @@ def _concept_version_id(location_id: str, source_id: str) -> str:
     return f"cvn_{digest[:12]}"
 
 
+def register_concept_bytes(store: Store, blobs: Blobs, settings: Settings, project_id: str,
+                           data: bytes, filename: str, *, max_pixels: int | None = None) -> Source:
+    """Validate image bytes and register them as a concept-purpose Source (content-addressed,
+    create-if-absent - identical bytes already stored under ANY purpose are reused untouched, so
+    source purpose/ingest eligibility is never changed here). Shared by the upload path and the
+    generated-image import so both get identical validation and dedup behavior.
+    max_pixels overrides the default pixel bound (files.MAX_REFERENCE_PIXELS) - still a bound.
+    Raises files.ImageValidationError (a ValueError) on invalid image content."""
+    from .ingest import source_uri   # local import: avoids a circular import at module load
+
+    mime = sniff_mime(data, filename)
+    validate_reference_image(data, mime, max_pixels=max_pixels)
+
+    sid = hashlib.sha256(data).hexdigest()
+    uri = source_uri(settings, project_id, sid, "original" + extension_for(filename, mime))
+    blobs.put(uri, data, mime)
+
+    concept_src = Source(
+        id=sid, filename=filename, mime_type=mime, kind=kind_for(mime), doc_type="concept",
+        size_bytes=len(data), storage_path=uri, status="digested",
+        source_purpose="concept",
+    )
+    stored_src, _ = store.put_source_if_absent(project_id, concept_src)
+    return stored_src
+
+
 def upload_concept_version(store: Store, blobs: Blobs, settings: Settings, project_id: str,
                            location_id: str, data: bytes, filename: str) -> tuple[ConceptVersion, bool]:
     """Store a user-uploaded concept-art image as a new version for a location.
@@ -93,21 +119,8 @@ def upload_concept_version(store: Store, blobs: Blobs, settings: Settings, proje
     MAX_REFERENCE_PIXELS, animated-image rejection) - see files.validate_reference_image.
     Raises ValueError on invalid image content (-> HTTP 400 at the route).
     """
-    from .ingest import source_uri   # local import: avoids a circular import at module load
-
-    mime = sniff_mime(data, filename)
-    validate_reference_image(data, mime)
-
-    sid = hashlib.sha256(data).hexdigest()
-    uri = source_uri(settings, project_id, sid, "original" + extension_for(filename, mime))
-    blobs.put(uri, data, mime)
-
-    concept_src = Source(
-        id=sid, filename=filename, mime_type=mime, kind=kind_for(mime), doc_type="concept",
-        size_bytes=len(data), storage_path=uri, status="digested",
-        source_purpose="concept",
-    )
-    stored_src, _ = store.put_source_if_absent(project_id, concept_src)
+    stored_src = register_concept_bytes(store, blobs, settings, project_id, data, filename)
+    sid = stored_src.id
 
     version = ConceptVersion(
         id=_concept_version_id(location_id, sid), location_id=location_id,

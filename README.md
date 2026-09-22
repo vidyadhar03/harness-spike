@@ -182,6 +182,47 @@ export HARNESS_API_INGEST_LOCK_STALE_AFTER_S=3600     # matches ingest.LOCK_STAL
 export HARNESS_API_INGEST_LOCK_RENEW_INTERVAL_S=900   # matches ingest.LOCK_RENEW_INTERVAL_S
 ```
 
+Base-location concept image generation (Luma Agents, optional - see `API_CONTRACT.md`):
+
+```bash
+export LUMA_AGENTS_API_KEY=...                 # server-side only; enables preview/submit/resume/resolve
+export HARNESS_GENERATION_MODEL=uni-1          # or uni-1-max
+export HARNESS_GENERATION_POLL_INTERVAL_S=3
+export HARNESS_GENERATION_MAX_WAIT_S=600       # per-run waiting budget, not a provider timeout
+export HARNESS_GENERATION_MAX_CONCURRENT=2
+export HARNESS_GENERATION_MAX_REQUEST_BYTES=33554432   # OUR cap on the whole serialized request (base64 incl.)
+export HARNESS_GENERATION_MAX_OUTPUT_PIXELS=16000000   # bound when importing a generated image (max 64000000)
+export HARNESS_GENERATION_ACCOUNT_SCOPE=...    # optional: stable Luma account id for provider-id uniqueness (default: key fingerprint)
+export HARNESS_GENERATION_LEASE_S=120          # worker ownership lapses this long after its last renewal
+export HARNESS_GENERATION_SWEEP_INTERVAL_S=30  # how often unowned/expired-lease jobs are picked up
+```
+
+Without `LUMA_AGENTS_API_KEY` generation is disabled (clear 503 on provider-dependent routes) while existing
+jobs and saved candidates stay readable.
+
+**Live smoke test (do this once before frontend integration; makes ONE paid generation).**
+Nothing in the test suite talks to Luma. `scripts/luma_smoke_test.py` refuses to run unless
+`LUMA_AGENTS_API_KEY` is set *and* `--i-accept-charges` is passed:
+
+```bash
+LUMA_AGENTS_API_KEY=... python scripts/luma_smoke_test.py --i-accept-charges            # 1 tiny inline reference
+LUMA_AGENTS_API_KEY=... python scripts/luma_smoke_test.py --i-accept-charges --refs 3   # optional: several references
+```
+
+What each printed step confirms, and what to do if it fails:
+
+1. `submit accepted` - the `image_ref: [{"data": <base64>, "media_type": "image/png"}]` payload is accepted for
+   `type: "image"`. An HTTP 422 / `SubmissionRejected` here means the inline shape is wrong: read the `detail`
+   message, and fall back to Luma's Files API (`file_id`) before shipping. Nothing was created on a rejection.
+2. `state=... kind=... model=... created_at=...` - the GET response really carries `type`, `model` and
+   `created_at`. If `kind`/`model` print `None`, attaching a provider id by hand (`resolve`) will be refused as
+   unverifiable - decide whether that is acceptable.
+3. `attach verification is POSSIBLE` - follows from step 2.
+4. `downloaded ... passed our import validation` - real output size/format fits our import bounds. If the output
+   exceeds `HARNESS_GENERATION_MAX_OUTPUT_PIXELS`, raise it (still bounded) rather than regenerating.
+
+Record the results; they are the evidence behind the "assumed" items in `API_CONTRACT.md`.
+
 There is deliberately no execution timeout on a references-pipeline run. It runs on a
 real OS thread that Python cannot force-cancel; a timeout on the *await* would let the
 job's lock and concurrency slot free (permitting a second concurrent run, or reporting a

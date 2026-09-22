@@ -139,7 +139,16 @@ def text_chunks(text: str, max_chars: int) -> list[str]:
 
 # --- user-uploaded reference image validation ---------------------------------
 
-def validate_reference_image(data: bytes, mime: str) -> tuple[int, int]:
+class ImageValidationError(ValueError):
+    """A ValueError (so every existing 400 path is unchanged) that also says WHICH bound failed, so
+    callers such as the generated-image import can report a specific reason. code is one of:
+    unsupported_format | too_many_pixels | animated | corrupt | format_mismatch."""
+    def __init__(self, message: str, code: str):
+        super().__init__(message)
+        self.code = code
+
+
+def validate_reference_image(data: bytes, mime: str, *, max_pixels: int | None = None) -> tuple[int, int]:
     """Decode-validate image bytes for user-uploaded location references.
 
     Returns (width, height) in pixels. Raises ValueError for:
@@ -152,23 +161,24 @@ def validate_reference_image(data: bytes, mime: str) -> tuple[int, int]:
     The streamed byte-count limit is enforced upstream by _read_body_bounded;
     this function validates content, not body size.
     """
+    limit = MAX_REFERENCE_PIXELS if max_pixels is None else max_pixels
     if mime not in ACCEPTED_REFERENCE_MIMES:
-        raise ValueError(
-            f"unsupported image format {mime!r}; accepted: jpeg, png, webp"
+        raise ImageValidationError(
+            f"unsupported image format {mime!r}; accepted: jpeg, png, webp", "unsupported_format"
         )
     try:
         with _PILImage.open(io.BytesIO(data)) as img:
             # 1. Dimensions from header metadata - no pixel decode yet.
             w, h = img.size
             # 2. Pixel-count guard BEFORE any full decode operation.
-            if w * h > MAX_REFERENCE_PIXELS:
-                raise ValueError(
+            if w * h > limit:
+                raise ImageValidationError(
                     f"image too large ({w}\u00d7{h} = {w*h:,} px); "
-                    f"limit is {MAX_REFERENCE_PIXELS:,} px total"
+                    f"limit is {limit:,} px total", "too_many_pixels"
                 )
             # 3. Reject animated images (APNG, animated WebP).
             if getattr(img, "n_frames", 1) > 1:
-                raise ValueError("animated images are not supported")
+                raise ImageValidationError("animated images are not supported", "animated")
             # 4. Force full pixel decode within known-safe bounds.
             #    Catches truncated bodies, decompression bombs (PIL raises
             #    DecompressionBombError at its own 178 MP limit, well above ours),

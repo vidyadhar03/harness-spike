@@ -428,6 +428,13 @@ class ConceptVersion(Doc):
     promoted_from_note_id: str | None = None
     promoted_from_note_revision: int | None = None
 
+    # Set iff this version was first created by importing a provider-generated image
+    # (author == "agent"): the ConceptGenerationJob that produced it. Like the promotion
+    # fields, never rewritten - if a later job (or upload) yields identical bytes for the
+    # same location the existing record wins untouched, and that later job records the
+    # reuse in its own reused_candidate_ids instead, so generation history stays complete.
+    generation_job_id: str | None = None
+
 
 class ConditionalNoteSnapshot(Strict):
     """One linked scene's requirements, captured at approval time - see ConceptApproval.
@@ -536,3 +543,67 @@ class ConceptApproval(Doc):
     # Free-text label, not an authenticated identity - this system has no login.
     locked_by: str | None = None
     locked_at: datetime = Field(default_factory=utcnow)
+
+
+# --- concept image generation jobs ----------------------------------------------------
+
+GenerationState = Literal[
+    "queued",                  # persisted, nothing sent to the provider yet
+    "submitting",              # a worker owns it and the POST may be in flight
+    "submission_unknown",      # POST outcome ambiguous / process died mid-POST: NEVER auto-resubmitted
+    "submitted",               # provider id known; waiting on the provider
+    "poll_deadline_exceeded",  # local waiting stopped - says nothing about the provider job
+    "generated",               # provider finished; output not yet imported into our storage
+    "import_failed",           # the provider generated the image but we could not import it; retry from the same provider job
+    "succeeded",               # candidates imported and linked
+    "failed",                  # terminal (see failure_stage/failure_code)
+]
+
+
+class ConceptGenerationJob(Doc):
+    """A durable, inspectable base-location concept generation. Persisted BEFORE any provider
+    call; see concept_generation.py for the state machine and recovery guarantees.
+
+    Deliberately separate from api.jobs.Job: that record is failed wholesale on process restart,
+    while this one must survive a restart and be resumed without paying for a second generation.
+    """
+    id: str                                   # deterministic from (project, workflow, idempotency key)
+    project_id: str
+    location_id: str
+    workflow: str
+    workflow_version: str
+    prompt_version: str
+    provider: str
+    model: str
+    idempotency_key: str
+    request_fingerprint: str                  # sha256 of the canonical request payload
+    context_token: str                        # of the exact input snapshot below
+    input_snapshot: dict                      # the exact validated snapshot, stored unchanged
+    prompt: str                               # the exact prompt sent (part of the snapshot's preview)
+
+    state: GenerationState = "queued"
+    provider_generation_id: str | None = None
+    submit_attempts: int = 0                  # incremented only by a claim that then calls submit
+    lease_owner: str | None = None            # atomic worker ownership (fenced updates)
+    lease_expires_at: datetime | None = None
+
+    candidate_ids: list[str] = Field(default_factory=list)          # every candidate this job yielded
+    reused_candidate_ids: list[str] = Field(default_factory=list)   # subset that already existed
+    failure_stage: Literal["submit", "provider", "import"] | None = None
+    failure_code: str | None = None
+    error: str | None = None                  # never contains credentials or URLs' query strings
+
+    submit_started_at: datetime | None = None   # when the worker claimed the current submit attempt
+
+    # Append-only audit trail. Nothing here is ever removed or rewritten - not by a resubmit, not by a
+    # later success - so an ambiguous attempt stays visible for as long as the job exists.
+    # attempt_history: one entry per submit attempt {attempt, startedAt, endedAt, outcome:
+    #   accepted|rejected|unknown, detail, providerGenerationId}.
+    # resolutions: one entry per human resolve action, with the verification performed and any
+    #   acknowledged duplicate-charge risk.
+    attempt_history: list[dict] = Field(default_factory=list)
+    resolutions: list[dict] = Field(default_factory=list)
+
+    submitted_at: datetime | None = None
+    provider_completed_at: datetime | None = None
+    finished_at: datetime | None = None

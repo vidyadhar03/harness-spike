@@ -18,7 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "reportlab>=4", "httpx>=0.27"]
-api = ["fastapi>=0.115", "uvicorn[standard]>=0.30"]
+api = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "httpx>=0.27"]
 
 [project.scripts]
 harness-memory = "harness.memory.cli:main"

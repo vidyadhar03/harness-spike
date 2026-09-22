@@ -7,9 +7,9 @@ import time
 from pydantic import TypeAdapter
 
 from .config import Settings
-from .models import ConceptApproval, ConceptVersion, Entity, Note, Project, Source
+from .models import ConceptApproval, ConceptGenerationJob, ConceptVersion, Entity, Note, Project, Source
 from .ports import (
-    ApprovalConflict, Blob, EntityDoc, NoteReviewConflict, OutputTruncated, ReplacementTooLarge, Part, T, Text, Uri,
+    ApprovalConflict, Blob, EntityDoc, NoteReviewConflict, ProviderIdConflict, OutputTruncated, ReplacementTooLarge, Part, T, Text, Uri,
 )
 from .schemas import gemini_schema, parse_json
 
@@ -327,6 +327,91 @@ class FirestoreStore:
     def get_concept_version(self, project_id, version_id):
         snap = self._col(project_id, "concept_versions").document(version_id).get()
         return ConceptVersion.model_validate(snap.to_dict()) if snap.exists else None
+
+    def put_generation_job_if_absent(self, project_id, job):
+        ref = self._col(project_id, "concept_generation_jobs").document(job.id)
+        transaction = self._db.transaction()
+
+        @firestore_transactional(self._db)
+        def _create(tx):
+            snap = ref.get(transaction=tx)
+            if snap.exists:
+                return ConceptGenerationJob.model_validate(snap.to_dict()), False
+            tx.set(ref, job.model_dump())
+            return job, True
+
+        return _create(transaction)
+
+    def get_generation_job(self, project_id, job_id):
+        snap = self._col(project_id, "concept_generation_jobs").document(job_id).get()
+        return ConceptGenerationJob.model_validate(snap.to_dict()) if snap.exists else None
+
+    def list_generation_jobs(self, project_id, location_id=None):
+        from google.cloud.firestore_v1.base_query import FieldFilter
+
+        q = self._col(project_id, "concept_generation_jobs")
+        if location_id is not None:
+            q = q.where(filter=FieldFilter("location_id", "==", location_id))
+        jobs = [ConceptGenerationJob.model_validate(d.to_dict()) for d in q.stream()]
+        return sorted(jobs, key=lambda j: (j.created_at, j.id))
+
+    def update_generation_job(self, project_id, job_id, guard, apply):
+        """Transactional read-guard-write, same shape as put_approval_if_current. NOT exercised
+        against real or emulated Firestore by this project's tests (MemoryStore's lock-based
+        equivalent is) - see put_note_if_current's docstring for that caveat."""
+        ref = self._col(project_id, "concept_generation_jobs").document(job_id)
+        transaction = self._db.transaction()
+
+        @firestore_transactional(self._db)
+        def _update(tx):
+            snap = ref.get(transaction=tx)
+            if not snap.exists:
+                raise KeyError(job_id)
+            current = ConceptGenerationJob.model_validate(snap.to_dict())
+            if not guard(current):
+                return None
+            updated = apply(current).touch()
+            tx.set(ref, updated.model_dump())
+            return updated
+
+        return _update(transaction)
+
+    def claim_provider_generation(self, project_id, job_id, *, provider, scope, generation_id, guard, apply):
+        """Transactional claim doc + job update. The claim lives in a top-level collection (not under
+        a project) so uniqueness spans projects; its doc id is a hash of the claim key because
+        provider ids may contain characters that are illegal in Firestore document ids. NOT exercised
+        against real or emulated Firestore by this project's tests (MemoryStore's lock-based
+        equivalent is) - see put_note_if_current's docstring for that caveat."""
+        import hashlib
+
+        digest = hashlib.sha256(f"{provider}\x00{scope}\x00{generation_id}".encode()).hexdigest()
+        claim_ref = self._db.collection("provider_generation_claims").document(digest)
+        job_ref = self._col(project_id, "concept_generation_jobs").document(job_id)
+        transaction = self._db.transaction()
+
+        @firestore_transactional(self._db)
+        def _claim(tx):
+            claim_snap = claim_ref.get(transaction=tx)
+            job_snap = job_ref.get(transaction=tx)
+            held = claim_snap.to_dict() if claim_snap.exists else None
+            if held is not None and (held["project_id"], held["job_id"]) != (project_id, job_id):
+                raise ProviderIdConflict(held["project_id"], held["job_id"])
+            if not job_snap.exists:
+                raise KeyError(job_id)
+            current = ConceptGenerationJob.model_validate(job_snap.to_dict())
+            if held is not None and current.provider_generation_id == generation_id:
+                return current
+            if not guard(current):
+                return None
+            updated = apply(current).touch()
+            if updated.provider_generation_id != generation_id:
+                raise ValueError("apply must record the claimed provider generation id")
+            tx.set(claim_ref, {"provider": provider, "scope": scope, "generation_id": generation_id,
+                               "project_id": project_id, "job_id": job_id})
+            tx.set(job_ref, updated.model_dump())
+            return updated
+
+        return _claim(transaction)
 
     def _approval_pointer(self, project_id, location_id):
         return self._project(project_id).collection("concept_approval_current").document(location_id)

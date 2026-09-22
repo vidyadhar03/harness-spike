@@ -36,6 +36,18 @@ class ApiSettings:
     # see tests/test_api.py's lock-renewal regression tests.
     ingest_lock_stale_after_s: float = LOCK_STALE_AFTER_S
     ingest_lock_renew_interval_s: float = LOCK_RENEW_INTERVAL_S
+    # Image generation (see harness.memory.concept_generation). The provider credential is read
+    # from LUMA_AGENTS_API_KEY by the entrypoint, never stored here.
+    generation_default_model: str = "uni-1"
+    generation_poll_interval_s: float = 3.0
+    generation_max_wait_s: float = 600.0     # local waiting budget per run; not a provider timeout
+    max_concurrent_generations: int = 2
+    # OUR operational cap on the whole serialized generation request (base64 included) - not a Luma
+    # limit; Luma documents no total body limit. See harness.memory.luma.
+    generation_max_request_bytes: int = 32 * 1024 * 1024
+    generation_max_output_pixels: int = 4_000 * 4_000     # bound for importing a generated image
+    generation_lease_s: float = 120.0                      # worker ownership lapses this long after its last renewal
+    generation_sweep_interval_s: float = 30.0              # how often unowned/expired-lease jobs are picked up
 
     @classmethod
     def from_env(cls) -> "ApiSettings":
@@ -56,4 +68,17 @@ class ApiSettings:
                                                     cls.ingest_lock_stale_after_s)),
             ingest_lock_renew_interval_s=float(env.get("HARNESS_API_INGEST_LOCK_RENEW_INTERVAL_S",
                                                        cls.ingest_lock_renew_interval_s)),
+            generation_default_model=env.get("HARNESS_GENERATION_MODEL", cls.generation_default_model),
+            generation_poll_interval_s=float(env.get("HARNESS_GENERATION_POLL_INTERVAL_S",
+                                                     cls.generation_poll_interval_s)),
+            generation_max_wait_s=float(env.get("HARNESS_GENERATION_MAX_WAIT_S", cls.generation_max_wait_s)),
+            max_concurrent_generations=int(env.get("HARNESS_GENERATION_MAX_CONCURRENT",
+                                                   cls.max_concurrent_generations)),
+            generation_max_request_bytes=int(env.get("HARNESS_GENERATION_MAX_REQUEST_BYTES",
+                                                     cls.generation_max_request_bytes)),
+            generation_max_output_pixels=int(env.get("HARNESS_GENERATION_MAX_OUTPUT_PIXELS",
+                                                     cls.generation_max_output_pixels)),
+            generation_lease_s=float(env.get("HARNESS_GENERATION_LEASE_S", cls.generation_lease_s)),
+            generation_sweep_interval_s=float(env.get("HARNESS_GENERATION_SWEEP_INTERVAL_S",
+                                                      cls.generation_sweep_interval_s)),
         )

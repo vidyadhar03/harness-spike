@@ -8,13 +8,14 @@ from __future__ import annotations
 
 from harness.memory.concepts import CORE_NOTES_CAVEAT, CURRENT_SNAPSHOT_SCHEMA_VERSION, approval_staleness_reasons
 from harness.memory.curate import CorrectionResult
-from harness.memory.models import ApprovedReference, ConceptApproval, ConceptVersion, Location, Note, Provenance, Scene, Source
+from harness.memory.models import ConceptGenerationJob, ApprovedReference, ConceptApproval, ConceptVersion, Location, Note, Provenance, Scene, Source
 from harness.memory.ports import Store
 from harness.memory.references import strip_heading_prefix
 from harness.memory.resolver import natural_key
 from harness.memory.retrieval import BRIEF_NOTE_KINDS, _Graph, _live, _reference, get_context, resolve_scope
 
 from .dto import (
+    GenerationCandidateOut, GenerationJobOut, GenerationPreviewOut, GenerationReferenceOut,
     ApprovalInheritedOut, ApprovalPackageOut, ApprovalPreviewOut,
     ApprovalStateOut, ApprovedReferenceOut, CitationOut, ConceptUploadOut, ConceptVersionListOut,
     ConceptVersionOut, IngestSourceResultOut, LocationDetail, LocationSceneRequirementOut, LocationSummary, NoteCorrectionResultOut, NoteOut,
@@ -197,6 +198,7 @@ def _concept_version_out(project_id: str, v: ConceptVersion, approved_id: str | 
         approved=(v.id == approved_id),
         promoted_from_note_id=v.promoted_from_note_id,
         promoted_from_note_revision=v.promoted_from_note_revision,
+        generation_job_id=v.generation_job_id,
     )
 
 
@@ -227,6 +229,7 @@ def concept_upload_out(store: Store, project_id: str, version: ConceptVersion, *
         filename=version.filename, created=created, approved=(version.id == approved_id),
         promoted_from_note_id=version.promoted_from_note_id,
         promoted_from_note_revision=version.promoted_from_note_revision,
+        generation_job_id=version.generation_job_id,
     )
 
 
@@ -418,4 +421,39 @@ def ingest_source_result_out(report: dict) -> IngestSourceResultOut:
         notes_written=report.get("notes_written", 0), notes_replaced=report.get("notes_replaced", 0),
         notes_reused=report.get("notes_reused", 0), warnings=report.get("warnings", []),
         error=report.get("error"),
+    )
+
+
+# --- base-location concept generation -------------------------------------------------------
+
+def generation_preview_out(project_id: str, location_id: str, prepared, provider_name: str) -> GenerationPreviewOut:
+    snap = prepared.snapshot
+    return GenerationPreviewOut(
+        location_id=location_id, workflow_version=snap["workflowVersion"], prompt_version=snap["promptVersion"],
+        provider=provider_name, model=snap["settings"]["model"], prompt=prepared.prompt,
+        references=[GenerationReferenceOut(
+            position=r["position"], note_id=r["noteId"], revision=r["revision"], source_id=r["sourceId"],
+            guidance=r["guidance"], direction=r["direction"],
+            image=f"/projects/{project_id}/references/{r['noteId']}/image") for r in snap["references"]],
+        settings=snap["settings"], snapshot=snap, context_token=prepared.context_token,
+    )
+
+
+def generation_job_out(job: ConceptGenerationJob, *, resumable: bool) -> GenerationJobOut:
+    reused = set(job.reused_candidate_ids)
+    return GenerationJobOut(
+        id=job.id, location_id=job.location_id, state=job.state,
+        terminal=job.state in ("succeeded", "failed"), resumable=resumable,
+        needs_attention=job.state == "submission_unknown",
+        provider=job.provider, model=job.model, workflow_version=job.workflow_version,
+        prompt_version=job.prompt_version, provider_generation_id=job.provider_generation_id,
+        submit_attempts=job.submit_attempts, prompt=job.prompt, context_token=job.context_token,
+        input_snapshot=job.input_snapshot,
+        candidates=[GenerationCandidateOut(id=c, image=f"/projects/{job.project_id}/concepts/{c}/image",
+                                           reused=c in reused) for c in job.candidate_ids],
+        failure_stage=job.failure_stage, failure_code=job.failure_code, error=job.error,
+        attempt_history=job.attempt_history, resolutions=job.resolutions,
+        submit_started_at=job.submit_started_at,
+        created_at=job.created_at, updated_at=job.updated_at, submitted_at=job.submitted_at,
+        provider_completed_at=job.provider_completed_at, finished_at=job.finished_at,
     )

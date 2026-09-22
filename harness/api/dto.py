@@ -300,6 +300,9 @@ class ConceptVersionOut(CamelModel):
     # harness.memory.concepts.promote_reference_to_concept.
     promoted_from_note_id: str | None = None
     promoted_from_note_revision: int | None = None
+    # Set for a provider-generated candidate (author == "agent"): the generation job that first
+    # created it. Null for uploads/promotions.
+    generation_job_id: str | None = None
 
 
 class ConceptVersionListOut(CamelModel):
@@ -325,6 +328,7 @@ class ConceptUploadOut(CamelModel):
     approved: bool
     promoted_from_note_id: str | None = None
     promoted_from_note_revision: int | None = None
+    generation_job_id: str | None = None
 
 
 class PromoteReferenceRequest(CamelModel):
@@ -471,3 +475,113 @@ class JobStatusOut(CamelModel):
     # (unlike references, an all-failed ingest still has per-source detail worth seeing).
     outcome: Literal["complete", "partial", "failed", "no_op"] | None = None
     sources: list[IngestSourceResultOut] | None = None
+
+
+# --- base-location concept generation ----------------------------------------------------
+
+class GenerationInputs(CamelModel):
+    reference_ids: list[str] = []
+    depiction_label: str | None = None
+    direction: str | None = None
+    model: str | None = None             # null = the server's configured default
+    aspect_ratio: str | None = None
+    output_format: str | None = None
+
+
+class GenerationPreviewRequest(GenerationInputs):
+    pass
+
+
+class GenerationSubmitRequest(GenerationInputs):
+    context_token: str
+    idempotency_key: str | None = None
+
+
+class GenerationReferenceOut(CamelModel):
+    position: int                        # 1-based; == prompt's "Reference image N" == image_ref[N-1]
+    note_id: str
+    revision: int
+    source_id: str
+    guidance: str | None
+    direction: str | None
+    image: str
+
+
+class GenerationPreviewOut(CamelModel):
+    location_id: str
+    workflow_version: str
+    prompt_version: str
+    provider: str
+    model: str
+    prompt: str                          # exactly what will be sent
+    references: list[GenerationReferenceOut]
+    settings: dict
+    snapshot: dict                       # the exact input snapshot the contextToken covers
+    context_token: str
+
+
+class GenerationCandidateOut(CamelModel):
+    id: str
+    image: str
+    reused: bool                         # identical bytes already existed as a candidate before this job
+
+
+class GenerationJobOut(CamelModel):
+    id: str
+    location_id: str
+    state: Literal["queued", "submitting", "submission_unknown", "submitted", "poll_deadline_exceeded",
+                   "generated", "import_failed", "succeeded", "failed"]
+    terminal: bool                       # succeeded | failed
+    resumable: bool                      # POST .../resume will pick it up
+    needs_attention: bool                # submission_unknown: a human decision is required
+    provider: str
+    model: str
+    workflow_version: str
+    prompt_version: str
+    provider_generation_id: str | None
+    submit_attempts: int
+    prompt: str
+    context_token: str
+    input_snapshot: dict
+    candidates: list[GenerationCandidateOut]
+    failure_stage: Literal["submit", "provider", "import"] | None
+    failure_code: str | None
+    error: str | None
+    attempt_history: list[dict]          # append-only: one entry per submit attempt
+    resolutions: list[dict]              # append-only: every human resolve action + verification/warning
+    submit_started_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+    submitted_at: datetime | None
+    provider_completed_at: datetime | None
+    finished_at: datetime | None
+
+
+class GenerationSubmitResultOut(CamelModel):
+    created: bool                        # false = same idempotency key + payload: the existing job
+    job: GenerationJobOut
+
+
+class GenerationResolveRequest(CamelModel):
+    action: Literal["attach_provider_id", "resubmit"]
+    provider_generation_id: str | None = None
+    acknowledge_no_provider_job: bool = False
+    by: str = "user"                     # free-text label recorded in the audit trail; not an identity
+
+
+class GenerationOptionsOut(CamelModel):
+    """Always 200. configured=false means submission/preview/resume/resolve are disabled (they return
+    503 with configurationError); reading existing jobs and candidates still works."""
+    configured: bool
+    configuration_error: str | None
+    provider: str | None
+    default_model: str | None
+    models: list[str]
+    aspect_ratios: list[str]
+    output_formats: list[str]
+    max_references: int | None
+    prompt_max_chars: int | None         # provider-documented (Luma: 6000)
+    # OUR operational limit on the whole serialized request, base64 included - not a provider limit.
+    # Reference images grow ~33% when encoded, so roughly max_request_bytes * 3/4 of raw image bytes fit.
+    max_request_bytes: int | None
+    max_output_pixels: int               # bound applied when importing a generated image

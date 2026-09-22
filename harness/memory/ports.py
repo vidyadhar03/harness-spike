@@ -4,11 +4,11 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Protocol, TypeVar, Union
+from typing import Callable, Protocol, TypeVar, Union
 
 from pydantic import BaseModel
 
-from .models import ConceptApproval, ConceptVersion, Location, Note, Project, Scene, Source, new_id, utcnow
+from .models import ConceptApproval, ConceptGenerationJob, ConceptVersion, Location, Note, Project, Scene, Source, new_id, utcnow
 
 T = TypeVar("T", bound=BaseModel)
 EntityDoc = Union[Location, Scene]
@@ -50,6 +50,14 @@ class ReplacementTooLarge(RuntimeError):
     def __init__(self, needed: int, limit: int):
         super().__init__(f"replacement needs {needed} operations but the store limit is {limit}")
         self.needed, self.limit = needed, limit
+
+
+class ProviderIdConflict(RuntimeError):
+    """A provider generation id is already claimed by a different harness job (see
+    Store.claim_provider_generation)."""
+    def __init__(self, project_id: str, job_id: str):
+        super().__init__(f"provider generation is already associated with job {job_id!r}")
+        self.project_id, self.job_id = project_id, job_id
 
 
 class NoteReviewConflict(RuntimeError):
@@ -232,6 +240,41 @@ class Store(Protocol):
     def get_current_approval(self, project_id: str, location_id: str) -> ConceptApproval | None:
         """The one ConceptApproval currently in effect for this location, or None."""
         ...
+    def put_generation_job_if_absent(self, project_id: str, job: ConceptGenerationJob) -> tuple[ConceptGenerationJob, bool]:
+        """Create only if no job with this id exists - the ids are deterministic per
+        (project, workflow, idempotency key), so this is what makes a repeat submission resolve
+        to the same job. Returns (job, True) when written, (existing, False) otherwise."""
+        ...
+    def get_generation_job(self, project_id: str, job_id: str) -> ConceptGenerationJob | None: ...
+    def list_generation_jobs(self, project_id: str, location_id: str | None = None) -> list[ConceptGenerationJob]:
+        """Oldest first, deterministic."""
+        ...
+    def update_generation_job(self, project_id: str, job_id: str,
+                              guard: Callable[[ConceptGenerationJob], bool],
+                              apply: Callable[[ConceptGenerationJob], ConceptGenerationJob]) -> ConceptGenerationJob | None:
+        """Atomic read-guard-write: applies `apply` and stores the result iff `guard(current)` is
+        true, returning the stored job; returns None (writing nothing) when the guard fails.
+        Raises KeyError if the job does not exist. This single primitive backs worker claims
+        (guard = state allows it AND no live lease), fenced updates (guard = still the lease
+        owner) and recovery transitions. guard/apply must be pure - the Firestore adapter may
+        run them more than once inside a retried transaction."""
+        ...
+    def claim_provider_generation(self, project_id: str, job_id: str, *, provider: str, scope: str,
+                                  generation_id: str,
+                                  guard: Callable[[ConceptGenerationJob], bool],
+                                  apply: Callable[[ConceptGenerationJob], ConceptGenerationJob]
+                                  ) -> ConceptGenerationJob | None:
+        """Atomically claim (provider, scope, generation_id) for this job AND apply the job update
+        that records it. The claim key is global - across projects - so one provider generation can
+        belong to at most one harness job. `scope` is the provider account identity.
+        - claimed by a different job -> raises ProviderIdConflict; nothing is written.
+        - already claimed by THIS job and the job already records this id -> returns the job
+          unchanged (idempotent retry; guard is not consulted).
+        - otherwise, if guard(job) is false -> returns None and writes no claim.
+        - otherwise writes the claim and the updated job together and returns the job.
+        `apply` must yield a job whose provider_generation_id == generation_id. Raises KeyError if
+        the job does not exist. guard/apply must be pure (Firestore may retry the transaction)."""
+        ...
     def put_approval_if_current(self, project_id: str, location_id: str, approval: ConceptApproval,
                                 expected_revision: int) -> tuple[ConceptApproval, bool]:
         """Compare-and-swap the location's "current approval" pointer.
@@ -346,6 +389,9 @@ class MemoryStore:
         self._notes_lock = threading.Lock()
         self._concepts_lock = threading.Lock()
         self._approvals_lock = threading.Lock()
+        self.generation_jobs: dict[tuple[str, str], ConceptGenerationJob] = {}
+        self.provider_claims: dict[tuple[str, str, str], tuple[str, str]] = {}   # (provider, scope, gid) -> (project, job)
+        self._generation_lock = threading.Lock()
 
     def get_project(self, project_id):
         return self.projects.get(project_id)
@@ -523,6 +569,56 @@ class MemoryStore:
     def get_concept_version(self, project_id, version_id):
         v = self.concept_versions.get((project_id, version_id))
         return v.model_copy(deep=True) if v else None
+
+    def put_generation_job_if_absent(self, project_id, job):
+        with self._generation_lock:
+            existing = self.generation_jobs.get((project_id, job.id))
+            if existing is not None:
+                return existing.model_copy(deep=True), False
+            self.generation_jobs[(project_id, job.id)] = job.model_copy(deep=True)
+            return job.model_copy(deep=True), True
+
+    def get_generation_job(self, project_id, job_id):
+        j = self.generation_jobs.get((project_id, job_id))
+        return j.model_copy(deep=True) if j else None
+
+    def list_generation_jobs(self, project_id, location_id=None):
+        jobs = [j.model_copy(deep=True) for (p, _), j in self.generation_jobs.items()
+                if p == project_id and (location_id is None or j.location_id == location_id)]
+        return sorted(jobs, key=lambda j: (j.created_at, j.id))
+
+    def update_generation_job(self, project_id, job_id, guard, apply):
+        with self._generation_lock:
+            current = self.generation_jobs.get((project_id, job_id))
+            if current is None:
+                raise KeyError(job_id)
+            snapshot = current.model_copy(deep=True)
+            if not guard(snapshot):
+                return None
+            updated = apply(snapshot).touch()
+            self.generation_jobs[(project_id, job_id)] = updated.model_copy(deep=True)
+            return updated.model_copy(deep=True)
+
+    def claim_provider_generation(self, project_id, job_id, *, provider, scope, generation_id, guard, apply):
+        key, owner = (provider, scope, generation_id), (project_id, job_id)
+        with self._generation_lock:
+            held = self.provider_claims.get(key)
+            if held is not None and held != owner:
+                raise ProviderIdConflict(*held)
+            current = self.generation_jobs.get(owner)
+            if current is None:
+                raise KeyError(job_id)
+            snapshot = current.model_copy(deep=True)
+            if held is not None and snapshot.provider_generation_id == generation_id:
+                return snapshot
+            if not guard(snapshot):
+                return None
+            updated = apply(snapshot).touch()
+            if updated.provider_generation_id != generation_id:
+                raise ValueError("apply must record the claimed provider generation id")
+            self.provider_claims[key] = owner
+            self.generation_jobs[owner] = updated.model_copy(deep=True)
+            return updated.model_copy(deep=True)
 
     def get_current_approval(self, project_id, location_id):
         aid = self.current_approval.get((project_id, location_id))
